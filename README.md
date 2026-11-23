@@ -1,19 +1,18 @@
-# Golf Swing Analyzer - Prototype 1
+# Golf Swing Analyzer - Prototype 3
 
-Prototype for an iPhone-friendly golf swing analysis app.
+Prototype 3 adds automatic body tracking using MediaPipe Pose Landmarker.
 
-## Current features
-- Down-the-Line or Face-On selection
-- iPhone camera recording
-- Local video review
-- Timeline scrubbing
-- Manual line tool
-- Three-point angle tool
-- Local swing naming/saving
+Current:
+- Down-the-Line / Face-On recording
+- Swing playback
+- Frame stepping
+- Manual line and angle tools
+- Address / Top / Impact / Finish markers
+- Automatic 33-landmark body pose tracking
+- Skeleton overlay follows the golfer during playback
+- Pose inference is performed in the browser/device; the app does not upload the video to a server
 
-## Next phases
-1. Improve recording/review
-2. Add persistent local swing video storage
-3. Add automatic body-joint detection
-4. Add automatic golf positions and measurements
-5. Add reference positions and swing comparison
+Important:
+- This is an experimental prototype, not a finished golf coaching system.
+- Pose accuracy can be affected by lighting, clothing, occlusion, camera angle, and fast club motion.
+- The next phase is to use the detected joints to calculate golf-specific measurements such as spine angle, shoulder turn, hip turn, knee flex, and shaft/body relationships.
