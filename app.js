@@ -132,29 +132,29 @@ if (autoTrackingBtn) {
         throw new Error('Swing video not found.');
       }
 
-      let canvas = document.getElementById('poseOverlay');
+     let canvas = document.getElementById('poseOverlay');
 
-      if (!canvas) {
+const videoWrap = document.getElementById('videoWrap');
 
-        canvas = document.createElement('canvas');
+if (!videoWrap) {
+  throw new Error('Video container not found.');
+}
 
-        canvas.id = 'poseOverlay';
+if (!canvas) {
+  canvas = document.createElement('canvas');
+  canvas.id = 'poseOverlay';
 
-        canvas.style.position = 'absolute';
-        canvas.style.left = '0';
-        canvas.style.top = '0';
-        canvas.style.width = '100%';
-        canvas.style.height = '100%';
-        canvas.style.pointerEvents = 'none';
+  canvas.style.position = 'absolute';
+  canvas.style.left = '0';
+  canvas.style.top = '0';
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  canvas.style.pointerEvents = 'none';
+  canvas.style.zIndex = '5';
 
-        const videoWrap =
-          document.getElementById('videoWrap');
-
-        if (videoWrap) {
-          videoWrap.style.position = 'relative';
-          videoWrap.appendChild(canvas);
-        }
-      }
+  videoWrap.style.position = 'relative';
+  videoWrap.appendChild(canvas);
+}
 
       await tracking.enableAutoTracking(
         video,
