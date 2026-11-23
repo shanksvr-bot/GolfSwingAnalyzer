@@ -35,10 +35,10 @@ export async function enableAutoTracking(video, canvas) {
 
     if (!video.paused) {
 
-      const result = poseLandmarker.detectForVideo(
-        video,
-        performance.now()
-      );
+     const result = poseLandmarker.detectForVideo(
+  video,
+  video.currentTime * 1000
+);
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
