@@ -1,9 +1,7 @@
-import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs";
-
 const $=s=>document.querySelector(s);
 const screens={home:$('#home'),camera:$('#camera'),review:$('#review')};
 let currentView='',stream=null,recorder=null,chunks=[],recording=false;
-let tool='line',points=[],poseLandmarker=null,poseReady=false,poseLoop=false,lastPoseTime=-1;
+let tool='line',points=[],poseLandmarker=null,poseReady=false,poseLoop=false,lastPoseTime=-1,poseLib=null;
 
 function show(name){Object.values(screens).forEach(x=>x.classList.remove('active'));screens[name].classList.add('active')}
 function formatTime(sec){if(!isFinite(sec))return '0:00.000';return `${Math.floor(sec/60)}:${String(Math.floor(sec%60)).padStart(2,'0')}.${String(Math.floor((sec%1)*1000)).padStart(3,'0')}`}
@@ -15,9 +13,16 @@ $('#newSwing').onclick=()=>{stopCamera();show('home')};
 
 async function startCamera(){
  try{
-  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:60}},audio:true});
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:60}},audio:true});
   $('#cameraVideo').srcObject=stream;
- }catch(e){$('#cameraStatus').textContent='Camera access was not available. Check Safari camera permission.'}
+  await $('#cameraVideo').play().catch(()=>{});
+  $('#cameraStatus').textContent='Camera ready. Position yourself in the frame.';
+ }catch(e){
+  console.error('Camera error:',e);
+  $('#cameraStatus').textContent='Camera could not start. Check Safari camera permission and reload the page.';
+  alert('Camera could not start. Please make sure Safari has camera access for this site, then reload.');
+ }
 }
 function stopCamera(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}show('home')}
 $('#recordButton').onclick=()=>recording?stopRecording():startRecording();
@@ -83,14 +88,19 @@ async function initPose(){
  if(poseReady)return true;
  $('#poseStatus').textContent='Loading body tracker…';
  try{
-  const vision=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
-  poseLandmarker=await PoseLandmarker.createFromOptions(vision,{
+  if(!poseLib){
+   poseLib=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs');
+  }
+  const vision=await poseLib.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
+  poseLandmarker=await poseLib.PoseLandmarker.createFromOptions(vision,{
    baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',delegate:'GPU'},
    runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5
   });
   poseReady=true;$('#poseStatus').textContent='Auto tracking ready';return true;
  }catch(e){
-  console.error(e);$('#poseStatus').textContent='Tracker could not load';return false;
+  console.error('Pose tracker failed to load:',e);
+  $('#poseStatus').textContent='Auto tracking unavailable';
+  return false;
  }
 }
 $('#poseToggle').onclick=async()=>{
