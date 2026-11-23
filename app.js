@@ -112,3 +112,73 @@ function loadSaved(){
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
 loadSaved();
+
+const autoTrackingBtn = document.getElementById('autoTrackingBtn');
+
+if (autoTrackingBtn) {
+
+  autoTrackingBtn.addEventListener('click', async () => {
+
+    autoTrackingBtn.disabled = true;
+    autoTrackingBtn.textContent = 'Loading Tracking...';
+
+    try {
+
+      const tracking = await import('./pose.js');
+
+      const video = document.getElementById('swingVideo');
+
+      if (!video) {
+        throw new Error('Swing video not found.');
+      }
+
+      let canvas = document.getElementById('poseOverlay');
+
+      if (!canvas) {
+
+        canvas = document.createElement('canvas');
+
+        canvas.id = 'poseOverlay';
+
+        canvas.style.position = 'absolute';
+        canvas.style.left = '0';
+        canvas.style.top = '0';
+        canvas.style.width = '100%';
+        canvas.style.height = '100%';
+        canvas.style.pointerEvents = 'none';
+
+        const videoWrap =
+          document.getElementById('videoWrap');
+
+        if (videoWrap) {
+          videoWrap.style.position = 'relative';
+          videoWrap.appendChild(canvas);
+        }
+      }
+
+      await tracking.enableAutoTracking(
+        video,
+        canvas
+      );
+
+      autoTrackingBtn.textContent =
+        'Auto Tracking On';
+
+    } catch (error) {
+
+      console.error(
+        'Automatic tracking failed:',
+        error
+      );
+
+      alert(
+        'Automatic tracking could not be loaded.'
+      );
+
+      autoTrackingBtn.disabled = false;
+
+      autoTrackingBtn.textContent =
+        'Enable Auto Tracking';
+    }
+  });
+}
