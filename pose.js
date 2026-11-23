@@ -31,13 +31,13 @@ export async function enableAutoTracking(video, canvas) {
 
   function drawLoop() {
 
-    if (!poseLandmarker || video.ended) return;
+   if (!poseLandmarker) return;
 
     if (!video.paused) {
 
      const result = poseLandmarker.detectForVideo(
   video,
-  video.currentTime * 1000
+  performance.now()
 );
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
