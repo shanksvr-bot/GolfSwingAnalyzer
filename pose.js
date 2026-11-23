@@ -32,15 +32,16 @@ export async function enableAutoTracking(video, canvas) {
   canvas.width = video.videoWidth || 1280;
   canvas.height = video.videoHeight || 720;
 
-  function drawLoop() {
+function drawLoop() {
 
-    if (
-      !poseLandmarker ||
-      video.paused ||
-      video.ended
-    ) {
-      return;
-    }
+  if (!poseLandmarker || video.ended) {
+    return;
+  }
+
+  if (video.paused) {
+    requestAnimationFrame(drawLoop);
+    return;
+  }
 
     const result =
       poseLandmarker.detectForVideo(
