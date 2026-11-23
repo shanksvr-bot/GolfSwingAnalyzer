@@ -171,9 +171,9 @@ if (autoTrackingBtn) {
         error
       );
 
-      alert(
-        'Automatic tracking could not be loaded.'
-      );
+     alert(
+  'Tracking Error: ' + error.message
+);
 
       autoTrackingBtn.disabled = false;
 
