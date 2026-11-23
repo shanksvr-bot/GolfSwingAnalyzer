@@ -132,7 +132,8 @@ function drawLoop() {
 
     requestAnimationFrame(drawLoop);
   }
-  drawLoop();
+  video.play().catch(() => {});
+drawLoop();
 }
 
 const autoTrackingBtn = document.getElementById('autoTrackingBtn');
