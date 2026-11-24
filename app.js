@@ -1,6 +1,7 @@
 const $=s=>document.querySelector(s);
 const screens={home:$('#home'),camera:$('#camera'),review:$('#review'),saved:$('#saved')};
 let currentView='',stream=null,recorder=null,chunks=[],recording=false;
+let uploadedVideoUrl=null;
 let tool='line',points=[],savedSwings=JSON.parse(localStorage.getItem('gsa_saved_v1')||'[]');
 
 function show(name){Object.values(screens).forEach(x=>x.classList.remove('active'));screens[name].classList.add('active')}
@@ -28,6 +29,56 @@ function stopCamera(){
 }
 $('#recordButton').onclick=()=>{
  if(recording) stopRecording(); else startRecording();
+};
+// UPLOAD A SAVED SWING FROM IPHONE
+const uploadButton = document.createElement('button');
+uploadButton.textContent = 'Upload Saved Swing';
+uploadButton.className = 'primaryButton';
+uploadButton.style.marginTop = '12px';
+
+const videoPicker = document.createElement('input');
+videoPicker.type = 'file';
+videoPicker.accept = 'video/*';
+videoPicker.style.display = 'none';
+
+$('#recordButton').insertAdjacentElement('afterend', uploadButton);
+document.body.appendChild(videoPicker);
+
+uploadButton.onclick = () => {
+  videoPicker.value = '';
+  videoPicker.click();
+};
+
+videoPicker.onchange = () => {
+  const file = videoPicker.files[0];
+
+  if (!file) return;
+
+  if (!file.type.startsWith('video/')) {
+    alert('Please select a video file.');
+    return;
+  }
+
+  if (uploadedVideoUrl) {
+    URL.revokeObjectURL(uploadedVideoUrl);
+  }
+
+  uploadedVideoUrl = URL.createObjectURL(file);
+
+  const video = $('#swingVideo');
+  video.pause();
+  video.src = uploadedVideoUrl;
+  video.load();
+
+  $('#emptyReview').style.display = 'none';
+  $('#playPause').textContent = '▶';
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  show('review');
 };
 function startRecording(){
  if(!stream){alert('Camera is not available.');return;}
