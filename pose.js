@@ -544,9 +544,7 @@ export async function enableAutoTracking(video, canvas) {
 
       // Position labels
       if (addressDetected) {
-
-             if (addressDetected) {
-
+            
         drawLabel(
           "ADDRESS  " +
           getTime(addressTime),
