@@ -62,16 +62,16 @@ videoPicker.onchange = () => {
   if (uploadedVideoUrl) {
     URL.revokeObjectURL(uploadedVideoUrl);
   }
+uploadedVideoUrl = URL.createObjectURL(file);
 
-  uploadedVideoUrl = URL.createObjectURL(file);
+const video = $('#swingVideo');
+video.pause();
+video.src = uploadedVideoUrl;
+video.load();
 
-  const video = $('#swingVideo');
-  video.pause();
-  video.src = uploadedVideoUrl;
-  video.load();
+$('#emptyReview').style.display = 'none';
+$('#playPause').textContent = '▶';
 
-  $('#emptyReview').style.display = 'none';
-  $('#playPause').textContent = '▶';
 
   if (stream) {
     stream.getTracks().forEach(track => track.stop());
