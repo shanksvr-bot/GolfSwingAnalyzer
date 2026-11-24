@@ -573,7 +573,6 @@ export async function enableAutoTracking(video, canvas) {
       );
   }
 
-  await video.play();
 
   drawLoop();
 }
