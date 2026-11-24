@@ -68,6 +68,165 @@ export async function enableAutoTracking(video, canvas) {
     return `${minutes}:${String(secs).padStart(2, "0")}`;
   }
 
+  function angleBetween(a, b, c) {
+
+    const ab = {
+      x: a.x - b.x,
+      y: a.y - b.y
+    };
+
+    const cb = {
+      x: c.x - b.x,
+      y: c.y - b.y
+    };
+
+    const dot =
+      ab.x * cb.x +
+      ab.y * cb.y;
+
+    const magAB =
+      Math.hypot(ab.x, ab.y);
+
+    const magCB =
+      Math.hypot(cb.x, cb.y);
+
+    if (!magAB || !magCB) {
+      return 0;
+    }
+
+    let value =
+      dot / (magAB * magCB);
+
+    value = Math.max(-1, Math.min(1, value));
+
+    return Math.acos(value) * 180 / Math.PI;
+  }
+
+  function calculateAddressMeasurements(landmarks) {
+
+    const leftShoulder = landmarks[11];
+    const rightShoulder = landmarks[12];
+
+    const leftHip = landmarks[23];
+    const rightHip = landmarks[24];
+
+    const leftKnee = landmarks[25];
+    const rightKnee = landmarks[26];
+
+    const leftAnkle = landmarks[27];
+    const rightAnkle = landmarks[28];
+
+    const shoulderMid = {
+      x: (leftShoulder.x + rightShoulder.x) / 2,
+      y: (leftShoulder.y + rightShoulder.y) / 2
+    };
+
+    const hipMid = {
+      x: (leftHip.x + rightHip.x) / 2,
+      y: (leftHip.y + rightHip.y) / 2
+    };
+
+    // Spine angle relative to vertical
+    const dx =
+      shoulderMid.x - hipMid.x;
+
+    const dy =
+      shoulderMid.y - hipMid.y;
+
+    const spineAngle =
+      Math.abs(
+        Math.atan2(dx, -dy) * 180 / Math.PI
+      );
+
+    const leftHipAngle =
+      angleBetween(
+        leftShoulder,
+        leftHip,
+        leftKnee
+      );
+
+    const rightHipAngle =
+      angleBetween(
+        rightShoulder,
+        rightHip,
+        rightKnee
+      );
+
+    const leftKneeAngle =
+      angleBetween(
+        leftHip,
+        leftKnee,
+        leftAnkle
+      );
+
+    const rightKneeAngle =
+      angleBetween(
+        rightHip,
+        rightKnee,
+        rightAnkle
+      );
+
+    return {
+      spineAngle,
+      leftHipAngle,
+      rightHipAngle,
+      leftKneeAngle,
+      rightKneeAngle
+    };
+  }
+
+  function drawMeasurementPanel(m) {
+
+    const x = 15;
+    const y = 110;
+    const width = 340;
+    const height = 180;
+
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.fillRect(x, y, width, height);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `${Math.round(canvas.width * 0.022)}px Arial`;
+
+    ctx.fillText(
+      "ADDRESS MEASUREMENTS",
+      x + 15,
+      y + 28
+    );
+
+    ctx.font = `${Math.round(canvas.width * 0.018)}px Arial`;
+
+    ctx.fillText(
+      `Spine: ${m.spineAngle.toFixed(1)}°`,
+      x + 15,
+      y + 60
+    );
+
+    ctx.fillText(
+      `Lead Hip: ${m.leftHipAngle.toFixed(1)}°`,
+      x + 15,
+      y + 88
+    );
+
+    ctx.fillText(
+      `Trail Hip: ${m.rightHipAngle.toFixed(1)}°`,
+      x + 15,
+      y + 116
+    );
+
+    ctx.fillText(
+      `Lead Knee: ${m.leftKneeAngle.toFixed(1)}°`,
+      x + 15,
+      y + 144
+    );
+
+    ctx.fillText(
+      `Trail Knee: ${m.rightKneeAngle.toFixed(1)}°`,
+      x + 15,
+      y + 172
+    );
+  }
+  
   function drawLabel(text, y) {
 
     ctx.font = `${Math.round(canvas.width * 0.025)}px Arial`;
@@ -386,11 +545,18 @@ export async function enableAutoTracking(video, canvas) {
       // Position labels
       if (addressDetected) {
 
+             if (addressDetected) {
+
         drawLabel(
           "ADDRESS  " +
           getTime(addressTime),
           15
         );
+
+        const measurements =
+          calculateAddressMeasurements(landmarks);
+
+        drawMeasurementPanel(measurements);
       }
 
       if (topDetected) {
