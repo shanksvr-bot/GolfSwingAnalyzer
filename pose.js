@@ -203,25 +203,25 @@ export async function enableAutoTracking(video, canvas) {
     );
 
     ctx.fillText(
-      `Lead Hip: ${m.leftHipAngle.toFixed(1)}°`,
+      `Left Hip: ${m.leftHipAngle.toFixed(1)}°`,
       x + 15,
       y + 88
     );
 
     ctx.fillText(
-      `Trail Hip: ${m.rightHipAngle.toFixed(1)}°`,
+        `Right Hip: ${m.rightHipAngle.toFixed(1)}°`,
       x + 15,
       y + 116
     );
 
-    ctx.fillText(
-      `Lead Knee: ${m.leftKneeAngle.toFixed(1)}°`,
+ctx.fillText(
+  `Left Knee: ${m.leftKneeAngle.toFixed(1)}°`,
       x + 15,
       y + 144
     );
 
-    ctx.fillText(
-      `Trail Knee: ${m.rightKneeAngle.toFixed(1)}°`,
+  ctx.fillText(
+  `Right Knee: ${m.rightKneeAngle.toFixed(1)}°`,
       x + 15,
       y + 172
     );
