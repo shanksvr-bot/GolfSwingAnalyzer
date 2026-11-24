@@ -175,7 +175,7 @@ if (autoTrackingBtn) {
 
     try {
 
-      const tracking = await import('./pose.js?v=3');
+      const tracking = await import('./pose.js?v=4');
 
       const video = document.getElementById('swingVideo');
 
