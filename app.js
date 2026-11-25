@@ -5,7 +5,8 @@ let currentView = '';
 let stream = null, recorder = null, chunks = [], recording = false;
 let videoUrl = null;                 // current blob URL (revoked when replaced)
 let tool = 'line', points = [];
-let savedSwings = JSON.parse(localStorage.getItem('gsa_saved_v1') || '[]');
+let currentBlob = null, currentSwingId = null;
+let Store = null;                    // lazily imported store.js
 
 // Auto-tracking state
 let Pose = null;                     // lazily imported pose.js module
@@ -75,7 +76,7 @@ function startRecording() {
     const blob = new Blob(chunks, { type: recorder.mimeType || 'video/mp4' });
     stopCamera(); // release the camera as soon as recording ends
     $('#camera').classList.remove('recording');
-    loadVideo(URL.createObjectURL(blob));
+    loadVideo(blob);
   };
   recorder.start();
   recording = true;
@@ -99,19 +100,23 @@ $('#videoPicker').onchange = e => {
   if (!file) return;
   if (!file.type.startsWith('video/')) { alert('Please select a video file.'); return; }
   stopCamera();
-  loadVideo(URL.createObjectURL(file));
+  loadVideo(file);
 };
 
 // One place that swaps the review video and resets everything tied to the old one.
-function loadVideo(url) {
+// opts.id / opts.analysis are set when reopening a saved swing.
+async function loadVideo(blob, opts = {}) {
   if (analysisAbort) analysisAbort.abort();
   if (videoUrl) URL.revokeObjectURL(videoUrl);
-  videoUrl = url;
+  const url = (videoUrl = URL.createObjectURL(blob));
+  currentBlob = blob;
+  currentSwingId = opts.id || null;
 
   analysis = null;
   if (Pose) Pose.clearPose(poseCanvas);
   resetTrackingUi();
   clearOverlay();
+  $('#saveSwing').textContent = currentSwingId ? 'Update Saved Swing' : 'Save Swing';
 
   swingVideo.pause();
   swingVideo.src = url;
@@ -119,6 +124,19 @@ function loadVideo(url) {
   $('#emptyReview').style.display = 'none';
   $('#playPause').textContent = '▶';
   show('review');
+
+  if (opts.analysis) {
+    try {
+      Pose = Pose || await import('./pose.js?v=10');
+      if (videoUrl !== url) return; // another video was loaded meanwhile
+      analysis = opts.analysis;
+      renderPhases();
+      $('#autoTrackingBtn').textContent = 'Re-run Tracking';
+      redrawPose();
+    } catch (e) {
+      console.error('Could not restore analysis', e);
+    }
+  }
 }
 
 // ------------------------------------------------------------------- review
@@ -230,6 +248,7 @@ function resetTrackingUi() {
   btn.textContent = 'Enable Auto Tracking';
   $('#trackingSummary').textContent = '';
   $('#phaseRow').innerHTML = '';
+  $('#metricsTable').innerHTML = '';
 }
 
 function renderPhases() {
@@ -253,6 +272,7 @@ function renderPhases() {
   }
   if (analysis.note) parts.push(analysis.note);
   $('#trackingSummary').textContent = parts.join(' • ');
+  renderMetrics();
 }
 
 $('#autoTrackingBtn').onclick = async () => {
@@ -267,9 +287,10 @@ $('#autoTrackingBtn').onclick = async () => {
   Pose?.clearPose(poseCanvas);
 
   try {
-    Pose = Pose || await import('./pose.js?v=9');
+    Pose = Pose || await import('./pose.js?v=10');
     btn.textContent = 'Loading model… (tap to cancel)';
     analysis = await Pose.analyzeVideo(swingVideo, {
+      view: currentView,
       signal: analysisAbort.signal,
       onProgress: (p, msg) => { btn.textContent = `${msg} ${Math.round(p * 100)}% (tap to cancel)`; },
     });
@@ -277,6 +298,9 @@ $('#autoTrackingBtn').onclick = async () => {
     renderPhases();
     redrawPose();
     btn.textContent = 'Re-run Tracking';
+    if (currentSwingId) { // keep an already-saved swing's analysis up to date
+      getStore().then(st => st.saveSwing({ id: currentSwingId, blob: currentBlob, analysis })).catch(console.error);
+    }
   } catch (error) {
     if (error.name !== 'AbortError') {
       console.error('Automatic tracking failed:', error);
@@ -290,21 +314,116 @@ $('#autoTrackingBtn').onclick = async () => {
   }
 };
 
-// -------------------------------------------------------------- saved swings
-$('#saveSwing').onclick = () => {
-  const name = prompt('Name this swing:', 'Driver swing');
-  if (!name) return;
-  savedSwings.unshift({ name, view: currentView, date: new Date().toLocaleString() });
-  localStorage.setItem('gsa_saved_v1', JSON.stringify(savedSwings));
-  alert('Swing saved.');
-  loadSaved();
-};
-function loadSaved() {
-  $('#savedList').innerHTML = savedSwings.length
-    ? savedSwings.map(s => `<div class="savedItem"><b>${escapeHtml(s.name)}</b><small>${escapeHtml(s.view)} • ${escapeHtml(s.date)}</small></div>`).join('')
-    : '<div class="infoCard"><b>No saved swings yet.</b><p>Saved swings will appear here.</p></div>';
+// ------------------------------------------------------------------- metrics
+function renderMetrics() {
+  const el = $('#metricsTable');
+  const m = analysis && analysis.metrics;
+  if (!m || !m.rows.length) { el.innerHTML = ''; return; }
+  const cols = [['address', 'Address'], ['top', 'Top'], ['impact', 'Impact']];
+  const cell = (row, k) => {
+    const v = row.values[k];
+    if (v == null) return '<td>–</td>';
+    const n = Math.round(v);
+    return `<td>${row.signed && n > 0 ? '+' : ''}${n}</td>`;
+  };
+  el.innerHTML =
+    `<h3>${escapeHtml(m.view || 'Swing')} measurements</h3>` +
+    `<table><thead><tr><th></th>${cols.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead><tbody>` +
+    m.rows.map(r => `<tr><th>${escapeHtml(r.label)}<small>${escapeHtml(r.unit)}</small></th>${cols.map(c => cell(r, c[0])).join('')}</tr>`).join('') +
+    `</tbody></table>` +
+    (m.note ? `<p class="metricsNote">${escapeHtml(m.note)}</p>` : '');
 }
+
+// -------------------------------------------------------------- saved swings
+async function getStore() { return Store || (Store = await import('./store.js?v=1')); }
+
+$('#saveSwing').onclick = async () => {
+  if (!currentBlob) { alert('Nothing to save yet.'); return; }
+  const btn = $('#saveSwing');
+  let name;
+  if (!currentSwingId) {
+    name = prompt('Name this swing:', 'Driver swing');
+    if (!name) return;
+  }
+  btn.disabled = true;
+  try {
+    const st = await getStore();
+    const meta = await st.saveSwing({ id: currentSwingId, name, view: currentView, blob: currentBlob, analysis });
+    currentSwingId = meta.id;
+    btn.textContent = 'Update Saved Swing';
+    st.requestPersistence();
+    alert(name ? 'Swing saved.' : 'Saved swing updated.');
+  } catch (e) {
+    console.error(e);
+    alert('Could not save: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// Old versions kept name/date only, in localStorage. Move them over once.
+async function migrateLegacy(st) {
+  const raw = localStorage.getItem('gsa_saved_v1');
+  if (!raw) return;
+  try {
+    for (const item of JSON.parse(raw)) await st.saveLegacy(item);
+    localStorage.removeItem('gsa_saved_v1');
+  } catch (e) { console.error('Legacy migration failed', e); }
+}
+
+function fmtDate(d) {
+  const x = new Date(d);
+  return isNaN(x) ? String(d) : x.toLocaleString();
+}
+
+async function loadSaved() {
+  const list = $('#savedList');
+  try {
+    const st = await getStore();
+    await migrateLegacy(st);
+    const items = await st.listSwings();
+    list.innerHTML = items.length
+      ? items.map(s => {
+          const bits = [s.view, fmtDate(s.date)];
+          if (s.tempo) bits.push(`Tempo ${s.tempo.toFixed(1)}:1`);
+          if (s.size) bits.push(`${(s.size / 1048576).toFixed(1)} MB`);
+          if (!s.hasVideo) bits.push('no video (saved before video storage)');
+          return `<div class="savedItem" data-id="${escapeHtml(s.id)}">
+            <div class="savedInfo"><b>${escapeHtml(s.name)}</b><small>${bits.filter(Boolean).map(escapeHtml).join(' • ')}</small></div>
+            <div class="savedActions">
+              ${s.hasVideo ? '<button class="smallButton" data-act="open">Open</button>' : ''}
+              <button class="smallButton danger" data-act="delete">Delete</button>
+            </div></div>`;
+        }).join('')
+      : '<div class="infoCard"><b>No saved swings yet.</b><p>Saved swings will appear here.</p></div>';
+  } catch (e) {
+    console.error(e);
+    list.innerHTML = `<div class="infoCard"><b>Couldn’t read saved swings.</b><p>${escapeHtml(e.message)}</p></div>`;
+  }
+}
+
+$('#savedList').addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = btn.closest('.savedItem').dataset.id;
+  try {
+    const st = await getStore();
+    if (btn.dataset.act === 'open') {
+      const rec = await st.getSwing(id);
+      if (!rec || !rec.blob) { alert('No video is stored for this swing.'); return; }
+      currentView = rec.meta.view || currentView;
+      await loadVideo(rec.blob, { id, analysis: rec.analysis });
+    } else if (confirm('Delete this saved swing?')) {
+      await st.deleteSwing(id);
+      if (currentSwingId === id) { currentSwingId = null; $('#saveSwing').textContent = 'Save Swing'; }
+      loadSaved();
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Something went wrong: ' + err.message);
+  }
+});
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
 }
-loadSaved();

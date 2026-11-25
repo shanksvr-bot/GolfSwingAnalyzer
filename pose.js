@@ -78,7 +78,7 @@ function seekTo(video, t) {
   });
 }
 
-export async function analyzeVideo(video, { onProgress = () => {}, signal } = {}) {
+export async function analyzeVideo(video, { view = '', onProgress = () => {}, signal } = {}) {
   if (!video.videoWidth || !isFinite(video.duration)) {
     throw new Error(
       'This video has no readable duration (some recorded WebM files lack it). Try an uploaded MP4/MOV.'
@@ -119,7 +119,7 @@ export async function analyzeVideo(video, { onProgress = () => {}, signal } = {}
   }
 
   onProgress(1, 'Analyzing');
-  return { frames, ...analyzeSwing(frames) };
+  return { frames, view, ...analyzeSwing(frames, view) };
 }
 
 // ---------------------------------------------------------------------------
@@ -174,21 +174,81 @@ function angleBetween(a, b, c) {
   return (Math.acos(v) * 180) / Math.PI;
 }
 
-function measure(L) {
-  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-  const sh = mid(L[11], L[12]);
-  const hip = mid(L[23], L[24]);
-  return {
-    spine: Math.abs((Math.atan2(sh.x - hip.x, -(sh.y - hip.y)) * 180) / Math.PI),
-    leftHip: angleBetween(L[11], L[23], L[25]),
-    rightHip: angleBetween(L[12], L[24], L[26]),
-    leftKnee: angleBetween(L[23], L[25], L[27]),
-    rightKnee: angleBetween(L[24], L[26], L[28]),
-  };
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const deg = r => (r * 180) / Math.PI;
+
+function spineAngle(L) {
+  const sh = mid(L[11], L[12]), hip = mid(L[23], L[24]);
+  return Math.abs(deg(Math.atan2(sh.x - hip.x, -(sh.y - hip.y))));
+}
+function shoulderTilt(L) {
+  let d = deg(Math.atan2(L[12].y - L[11].y, L[12].x - L[11].x));
+  if (d > 90) d -= 180;
+  if (d < -90) d += 180;
+  return Math.abs(d);
+}
+function kneeFlex(L) {
+  // In a side-on view one leg hides the other, so use whichever side is more visible.
+  const left = L[25].v + L[27].v >= L[26].v + L[28].v;
+  const [h, k, an] = left ? [23, 25, 27] : [24, 26, 28];
+  return 180 - angleBetween(L[h], L[k], L[an]); // 0 = straight leg
 }
 
-function analyzeSwing(frames) {
-  const empty = { phases: [], addressMeasurements: null, tempo: null, note: '' };
+// Metrics depend on the camera view: each view can only measure what it can actually see in 2D.
+//  Down the Line (side-on): spine angle, knee flex, head height.
+//  Face On: shoulder tilt, hip/head shift toward the target, stance width.
+function buildMetrics(frames, phases, view) {
+  const at = {};
+  for (const p of phases) {
+    if (['address', 'top', 'impact'].includes(p.key) && frames[p.frame]?.lm) at[p.key] = frames[p.frame].lm;
+  }
+  const base = at.address;
+  if (!base) return null;
+
+  const rows = [];
+  const row = (label, unit, fn, keys = ['address', 'top', 'impact'], signed = false) => {
+    const values = {};
+    for (const k of keys) {
+      if (!at[k]) continue;
+      const v = fn(at[k]);
+      if (v != null && isFinite(v)) values[k] = v;
+    }
+    if (Object.keys(values).length) rows.push({ label, unit, values, signed });
+  };
+  const noseOk = L => L[0] && L[0].v >= 0.3;
+
+  let note = '';
+  if (view === 'Face On') {
+    const sw = dist(base[11], base[12]); // address shoulder width = the yardstick
+    if (sw > 0.03) {
+      // Target direction isn't known, so infer it: hips move toward the target going into impact.
+      let dir = 1;
+      if (at.top && at.impact) {
+        dir = mid(at.impact[23], at.impact[24]).x >= mid(at.top[23], at.top[24]).x ? 1 : -1;
+        note = 'Shift is measured toward the target, inferred from hip movement into impact.';
+      }
+      const hipX = L => mid(L[23], L[24]).x;
+      row('Shoulder tilt', '°', shoulderTilt);
+      row('Hip shift', '% of shoulder width', L => ((hipX(L) - hipX(base)) * dir / sw) * 100, ['top', 'impact'], true);
+      row('Head shift', '% of shoulder width',
+        L => (noseOk(L) && noseOk(base) ? ((L[0].x - base[0].x) * dir / sw) * 100 : null), ['top', 'impact'], true);
+      row('Stance width', '% of shoulder width', L => (dist(L[27], L[28]) / sw) * 100, ['address']);
+    }
+  } else {
+    const torso = dist(mid(base[11], base[12]), mid(base[23], base[24]));
+    row('Spine angle', '° from vertical', spineAngle);
+    row('Knee flex', '° (0 = straight)', kneeFlex, ['address', 'impact']);
+    if (torso > 0.03) {
+      row('Head height', '% of torso, + = higher',
+        L => (noseOk(L) && noseOk(base) ? ((base[0].y - L[0].y) / torso) * 100 : null), ['top', 'impact'], true);
+    }
+  }
+  return { view, rows, note };
+}
+
+export function analyzeSwing(frames, view = '') {
+  const empty = { phases: [], metrics: null, tempo: null, note: '' };
   const S = buildSamples(frames);
   if (S.length < 10) {
     return { ...empty, note: 'Could not see the golfer clearly enough. Check framing and lighting.' };
@@ -230,7 +290,6 @@ function analyzeSwing(frames) {
   }
 
   const phases = [{ key: 'address', label: PHASE_LABELS.address, t: S[a].t, frame: S[a].i }];
-  const addressMeasurements = frames[S[a].i].lm ? measure(frames[S[a].i].lm) : null;
 
   // --- Top: hysteresis. Hands rise TOP_RISE above address, then drop TOP_DROP from the peak ---
   let peak = a, armed = false, top = -1;
@@ -243,7 +302,7 @@ function analyzeSwing(frames) {
     }
   }
   if (top < 0) {
-    return { phases, addressMeasurements, tempo: null, note: 'Found address but no complete backswing.' };
+    return { phases, metrics: buildMetrics(frames, phases, view), tempo: null, note: 'Found address but no complete backswing.' };
   }
   phases.push({ key: 'top', label: PHASE_LABELS.top, t: S[top].t, frame: S[top].i });
 
@@ -256,7 +315,7 @@ function analyzeSwing(frames) {
     }
   }
   if (imp < 0) {
-    return { phases, addressMeasurements, tempo: null, note: 'Found top of backswing but not impact.' };
+    return { phases, metrics: buildMetrics(frames, phases, view), tempo: null, note: 'Found top of backswing but not impact.' };
   }
   phases.push({ key: 'impact', label: PHASE_LABELS.impact, t: S[imp].t, frame: S[imp].i });
 
@@ -273,7 +332,7 @@ function analyzeSwing(frames) {
   const down = S[imp].t - S[top].t;
   const tempo = down > 0 ? { backswing: back, downswing: down, ratio: back / down } : null;
 
-  return { phases, addressMeasurements, tempo, note: '' };
+  return { phases, metrics: buildMetrics(frames, phases, view), tempo, note: '' };
 }
 
 // ---------------------------------------------------------------------------
@@ -365,19 +424,6 @@ export function drawPose(video, canvas, analysis) {
 
   let y = 10;
   y = box([`${current.label}  ${current.t.toFixed(2)}s`], y);
-
-  const m = analysis.addressMeasurements;
-  if (m) {
-    y = box(
-      [
-        'AT ADDRESS',
-        `Spine tilt ${m.spine.toFixed(0)}°`,
-        `Hips L/R ${m.leftHip.toFixed(0)}° / ${m.rightHip.toFixed(0)}°`,
-        `Knees L/R ${m.leftKnee.toFixed(0)}° / ${m.rightKnee.toFixed(0)}°`,
-      ],
-      y
-    );
-  }
 
   const impact = analysis.phases.find(p => p.key === 'impact');
   if (analysis.tempo && impact && now >= impact.t) {
