@@ -51,3 +51,10 @@ header p{margin:0;color:var(--muted);line-height:1.45}
 .savedItem{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
 .savedItem b{display:block}.savedItem small{color:var(--muted)}
 @media(min-width:700px){.screen{max-width:900px;margin:auto}.cameraArea{max-height:70vh}}
+
+#poseOverlay{position:absolute;pointer-events:none;z-index:5}
+#uploadButton{margin-top:12px}
+.trackingSummary{margin-top:10px;color:var(--muted);font-size:13px;line-height:1.4}
+.phaseRow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.phaseButton{border:1px solid var(--accent);background:var(--card);color:var(--accent);border-radius:10px;padding:8px 14px;font-weight:600}
+.phaseButton:active{background:var(--accent);color:#fff}

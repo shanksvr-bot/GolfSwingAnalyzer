@@ -1,578 +1,386 @@
-let poseLandmarker = null;
-let animationFrame = null;
+// pose.js
+// Flow: analyzeVideo() runs pose estimation once over the whole clip (seek-based),
+// then detects swing phases from the full hand trajectory. drawPose() just reads
+// the stored data, so scrubbing, replay and phase-jumping all work with no live inference.
 
-export async function enableAutoTracking(video, canvas) {
+const VISION = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34';
+const MODEL =
+  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
-  const { FilesetResolver, PoseLandmarker } = await import(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/vision_bundle.mjs"
-  );
+export const SAMPLE_FPS = 30; // analysis rate. Raise for slow-mo clips if you want finer impact timing.
 
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm"
-  );
+// ---- Tunable detection constants (all distances are in "torso lengths") ----
+const MIN_VISIBILITY = 0.35;
+const STABLE_SECONDS = 0.4;   // hands must be still this long to count as address
+const STABLE_TOL = 0.05;      // max wobble inside the address window
+const TAKEAWAY_TOL = 0.12;    // how far hands move from address before it's "takeaway"
+const TOP_RISE = 0.35;        // hands must rise this far above address to arm top detection
+const TOP_DROP = 0.30;        // ...then fall this far below the peak to confirm the top
+const IMPACT_BAND = 0.10;     // impact = hands back within this distance of address height
 
-  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-      delegate: "GPU"
-    },
-    runningMode: "VIDEO",
-    numPoses: 1,
-    minPoseDetectionConfidence: 0.5,
-    minPosePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5
+const CONNECTIONS = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [24, 26], [26, 28],
+  [27, 29], [29, 31], [28, 30], [30, 32],
+];
+
+const PHASE_LABELS = {
+  address: 'ADDRESS',
+  top: 'TOP OF BACKSWING',
+  impact: 'IMPACT',
+  finish: 'FINISH',
+};
+
+// ---------------------------------------------------------------------------
+// Model loading (cached; GPU first, CPU fallback)
+// ---------------------------------------------------------------------------
+let landmarker = null;
+let lastTimestamp = 0; // detectForVideo needs strictly increasing timestamps across runs
+
+async function getLandmarker() {
+  if (landmarker) return landmarker;
+  const { FilesetResolver, PoseLandmarker } = await import(`${VISION}/vision_bundle.mjs`);
+  const fileset = await FilesetResolver.forVisionTasks(`${VISION}/wasm`);
+  const make = delegate =>
+    PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL, delegate },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+  try {
+    landmarker = await make('GPU');
+  } catch (e) {
+    console.warn('GPU delegate failed, falling back to CPU', e);
+    landmarker = await make('CPU');
+  }
+  return landmarker;
+}
+
+// ---------------------------------------------------------------------------
+// Frame-by-frame analysis
+// ---------------------------------------------------------------------------
+function seekTo(video, t) {
+  return new Promise(resolve => {
+    if (Math.abs(video.currentTime - t) < 0.0005) return resolve();
+    let timer;
+    const onSeeked = () => {
+      clearTimeout(timer);
+      video.removeEventListener('seeked', onSeeked);
+      setTimeout(resolve, 10); // let the decoded frame settle before inference
+    };
+    video.addEventListener('seeked', onSeeked);
+    timer = setTimeout(onSeeked, 1500); // never hang on a missed event
+    video.currentTime = t;
+  });
+}
+
+export async function analyzeVideo(video, { onProgress = () => {}, signal } = {}) {
+  if (!video.videoWidth || !isFinite(video.duration)) {
+    throw new Error(
+      'This video has no readable duration (some recorded WebM files lack it). Try an uploaded MP4/MOV.'
+    );
+  }
+
+  onProgress(0, 'Loading model…');
+  const lm = await getLandmarker();
+
+  const wasPaused = video.paused;
+  const startTime = video.currentTime;
+  video.pause();
+
+  const count = Math.floor(video.duration * SAMPLE_FPS) + 1;
+  const frames = [];
+
+  try {
+    for (let i = 0; i < count; i++) {
+      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+      const t = i / SAMPLE_FPS;
+      await seekTo(video, Math.min(t, video.duration));
+
+      lastTimestamp += 1000 / SAMPLE_FPS;
+      const result = lm.detectForVideo(video, lastTimestamp);
+      const pts = result.landmarks?.[0];
+
+      frames.push({
+        t,
+        lm: pts ? pts.map(p => ({ x: p.x, y: p.y, v: p.visibility ?? 1 })) : null,
+      });
+
+      if (i % 3 === 0) onProgress((i + 1) / count, 'Analyzing');
+    }
+  } finally {
+    video.currentTime = startTime;
+    if (!wasPaused) video.play().catch(() => {});
+  }
+
+  onProgress(1, 'Analyzing');
+  return { frames, ...analyzeSwing(frames) };
+}
+
+// ---------------------------------------------------------------------------
+// Swing analysis from the full trajectory
+// ---------------------------------------------------------------------------
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+const median = a => {
+  const s = [...a].sort((x, y) => x - y);
+  return s[Math.floor(s.length / 2)];
+};
+
+function buildSamples(frames) {
+  const raw = [];
+  frames.forEach((f, i) => {
+    const L = f.lm;
+    if (!L) return;
+    for (const k of [11, 12, 15, 16, 23, 24]) {
+      if (!L[k] || L[k].v < MIN_VISIBILITY) return;
+    }
+    const shoulderY = (L[11].y + L[12].y) / 2;
+    const hipY = (L[23].y + L[24].y) / 2;
+    raw.push({
+      i,
+      t: f.t,
+      x: (L[15].x + L[16].x) / 2,
+      y: (L[15].y + L[16].y) / 2,
+      shoulderY,
+      hipY,
+      torso: Math.max(0.05, hipY - shoulderY),
+    });
   });
 
-  const ctx = canvas.getContext("2d");
-
-  canvas.width = video.videoWidth || 1280;
-  canvas.height = video.videoHeight || 720;
-
-  // -----------------------------------------
-  // SWING POSITION DETECTION
-  // -----------------------------------------
-
-  let addressDetected = false;
-  let topDetected = false;
-
-  let addressTime = null;
-  let topTime = null;
-
-  let lastVideoTime = -1;
-
-  // Store hand movement throughout the swing
-  let handHistory = [];
-
-  // Used to prevent false Top detection
-  let lastHandY = null;
-  let upwardMovementStarted = false;
-
-  function resetDetection() {
-    addressDetected = false;
-    topDetected = false;
-
-    addressTime = null;
-    topTime = null;
-
-    handHistory = [];
-
-    lastHandY = null;
-    upwardMovementStarted = false;
-  }
-
-  function getTime(seconds) {
-    const minutes = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-
-    return `${minutes}:${String(secs).padStart(2, "0")}`;
-  }
-
-  function angleBetween(a, b, c) {
-
-    const ab = {
-      x: a.x - b.x,
-      y: a.y - b.y
-    };
-
-    const cb = {
-      x: c.x - b.x,
-      y: c.y - b.y
-    };
-
-    const dot =
-      ab.x * cb.x +
-      ab.y * cb.y;
-
-    const magAB =
-      Math.hypot(ab.x, ab.y);
-
-    const magCB =
-      Math.hypot(cb.x, cb.y);
-
-    if (!magAB || !magCB) {
-      return 0;
+  // 5-sample moving average to kill landmark jitter
+  const W = 2;
+  return raw.map((p, k) => {
+    let sx = 0, sy = 0, c = 0;
+    for (let j = Math.max(0, k - W); j <= Math.min(raw.length - 1, k + W); j++) {
+      sx += raw[j].x;
+      sy += raw[j].y;
+      c++;
     }
+    return { ...p, x: sx / c, y: sy / c };
+  });
+}
 
-    let value =
-      dot / (magAB * magCB);
+function angleBetween(a, b, c) {
+  const abx = a.x - b.x, aby = a.y - b.y;
+  const cbx = c.x - b.x, cby = c.y - b.y;
+  const mag = Math.hypot(abx, aby) * Math.hypot(cbx, cby);
+  if (!mag) return 0;
+  const v = Math.max(-1, Math.min(1, (abx * cbx + aby * cby) / mag));
+  return (Math.acos(v) * 180) / Math.PI;
+}
 
-    value = Math.max(-1, Math.min(1, value));
+function measure(L) {
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const sh = mid(L[11], L[12]);
+  const hip = mid(L[23], L[24]);
+  return {
+    spine: Math.abs((Math.atan2(sh.x - hip.x, -(sh.y - hip.y)) * 180) / Math.PI),
+    leftHip: angleBetween(L[11], L[23], L[25]),
+    rightHip: angleBetween(L[12], L[24], L[26]),
+    leftKnee: angleBetween(L[23], L[25], L[27]),
+    rightKnee: angleBetween(L[24], L[26], L[28]),
+  };
+}
 
-    return Math.acos(value) * 180 / Math.PI;
+function analyzeSwing(frames) {
+  const empty = { phases: [], addressMeasurements: null, tempo: null, note: '' };
+  const S = buildSamples(frames);
+  if (S.length < 10) {
+    return { ...empty, note: 'Could not see the golfer clearly enough. Check framing and lighting.' };
   }
+  const torso = median(S.map(p => p.torso));
 
-  function calculateAddressMeasurements(landmarks) {
+  // --- Address: first stretch where the hands are still and in a sensible place ---
+  let ref = null;
+  for (let s = 0; s < S.length; s++) {
+    let e = s;
+    while (e + 1 < S.length && S[e + 1].t - S[s].t <= STABLE_SECONDS) e++;
+    if (S[e].t - S[s].t < STABLE_SECONDS * 0.9) break;
 
-    const leftShoulder = landmarks[11];
-    const rightShoulder = landmarks[12];
-
-    const leftHip = landmarks[23];
-    const rightHip = landmarks[24];
-
-    const leftKnee = landmarks[25];
-    const rightKnee = landmarks[26];
-
-    const leftAnkle = landmarks[27];
-    const rightAnkle = landmarks[28];
-
-    const shoulderMid = {
-      x: (leftShoulder.x + rightShoulder.x) / 2,
-      y: (leftShoulder.y + rightShoulder.y) / 2
-    };
-
-    const hipMid = {
-      x: (leftHip.x + rightHip.x) / 2,
-      y: (leftHip.y + rightHip.y) / 2
-    };
-
-    // Spine angle relative to vertical
-    const dx =
-      shoulderMid.x - hipMid.x;
-
-    const dy =
-      shoulderMid.y - hipMid.y;
-
-    const spineAngle =
-      Math.abs(
-        Math.atan2(dx, -dy) * 180 / Math.PI
-      );
-
-    const leftHipAngle =
-      angleBetween(
-        leftShoulder,
-        leftHip,
-        leftKnee
-      );
-
-    const rightHipAngle =
-      angleBetween(
-        rightShoulder,
-        rightHip,
-        rightKnee
-      );
-
-    const leftKneeAngle =
-      angleBetween(
-        leftHip,
-        leftKnee,
-        leftAnkle
-      );
-
-    const rightKneeAngle =
-      angleBetween(
-        rightHip,
-        rightKnee,
-        rightAnkle
-      );
-
-    return {
-      spineAngle,
-      leftHipAngle,
-      rightHipAngle,
-      leftKneeAngle,
-      rightKneeAngle
-    };
-  }
-
-  function drawMeasurementPanel(m) {
-
-    const x = 15;
-    const y = 110;
-    const width = 340;
-    const height = 180;
-
-    ctx.fillStyle = "rgba(0,0,0,0.78)";
-    ctx.fillRect(x, y, width, height);
-
-    ctx.fillStyle = "#ffffff";
-    ctx.font = `${Math.round(canvas.width * 0.022)}px Arial`;
-
-    ctx.fillText(
-      "ADDRESS MEASUREMENTS",
-      x + 15,
-      y + 28
+    const win = S.slice(s, e + 1);
+    const mx = mean(win.map(p => p.x));
+    const my = mean(win.map(p => p.y));
+    const ok = win.every(
+      p =>
+        Math.hypot(p.x - mx, p.y - my) < STABLE_TOL * torso &&
+        p.y > p.shoulderY &&
+        p.y < p.hipY + 0.5 * torso
     );
-
-    ctx.font = `${Math.round(canvas.width * 0.018)}px Arial`;
-
-    ctx.fillText(
-      `Spine: ${m.spineAngle.toFixed(1)}°`,
-      x + 15,
-      y + 60
-    );
-
-    ctx.fillText(
-      `Left Hip: ${m.leftHipAngle.toFixed(1)}°`,
-      x + 15,
-      y + 88
-    );
-
-    ctx.fillText(
-        `Right Hip: ${m.rightHipAngle.toFixed(1)}°`,
-      x + 15,
-      y + 116
-    );
-
-ctx.fillText(
-  `Left Knee: ${m.leftKneeAngle.toFixed(1)}°`,
-      x + 15,
-      y + 144
-    );
-
-  ctx.fillText(
-  `Right Knee: ${m.rightKneeAngle.toFixed(1)}°`,
-      x + 15,
-      y + 172
-    );
-  }
-  
-  function drawLabel(text, y) {
-
-    ctx.font = `${Math.round(canvas.width * 0.025)}px Arial`;
-
-    const padding = 12;
-    const width = ctx.measureText(text).width;
-
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(
-      15,
-      y,
-      width + padding * 2,
-      38
-    );
-
-    ctx.fillStyle = "#ffffff";
-
-    ctx.fillText(
-      text,
-      15 + padding,
-      y + 26
-    );
-  }
-
-  function detectSwingPositions(landmarks) {
-
-    const required = [
-      11, 12,       // shoulders
-      15, 16,       // wrists
-      23, 24        // hips
-    ];
-
-    for (const i of required) {
-
-      if (
-        !landmarks[i] ||
-        (landmarks[i].visibility ?? 1) < 0.35
-      ) {
-        return;
-      }
+    if (ok) {
+      ref = { x: mx, y: my, end: e };
+      break;
     }
+  }
+  if (!ref) {
+    return { ...empty, note: 'Could not find a steady address position at the start of the clip.' };
+  }
 
-    const leftHand = landmarks[15];
-    const rightHand = landmarks[16];
+  // Extend address forward until the hands actually leave (takeaway)
+  let a = ref.end;
+  while (
+    a + 1 < S.length &&
+    Math.hypot(S[a + 1].x - ref.x, S[a + 1].y - ref.y) < TAKEAWAY_TOL * torso
+  ) {
+    a++;
+  }
 
-    const handX =
-      (leftHand.x + rightHand.x) / 2;
+  const phases = [{ key: 'address', label: PHASE_LABELS.address, t: S[a].t, frame: S[a].i }];
+  const addressMeasurements = frames[S[a].i].lm ? measure(frames[S[a].i].lm) : null;
 
-    const handY =
-      (leftHand.y + rightHand.y) / 2;
-
-    const shoulderY =
-      (landmarks[11].y + landmarks[12].y) / 2;
-
-    const hipY =
-      (landmarks[23].y + landmarks[24].y) / 2;
-
-    const now = video.currentTime;
-
-    // Save hand position for later analysis
-    handHistory.push({
-      time: now,
-      x: handX,
-      y: handY,
-      shoulderY,
-      hipY
-    });
-
-    // Keep history from growing indefinitely
-    if (handHistory.length > 600) {
-      handHistory.shift();
+  // --- Top: hysteresis. Hands rise TOP_RISE above address, then drop TOP_DROP from the peak ---
+  let peak = a, armed = false, top = -1;
+  for (let k = a + 1; k < S.length; k++) {
+    if (S[k].y < S[peak].y) peak = k;
+    if (!armed && ref.y - S[peak].y > TOP_RISE * torso) armed = true;
+    if (armed && S[k].y - S[peak].y > TOP_DROP * torso) {
+      top = peak;
+      break;
     }
+  }
+  if (top < 0) {
+    return { phases, addressMeasurements, tempo: null, note: 'Found address but no complete backswing.' };
+  }
+  phases.push({ key: 'top', label: PHASE_LABELS.top, t: S[top].t, frame: S[top].i });
 
-    // -----------------------------------------
-    // ADDRESS
-    // -----------------------------------------
-
-    if (!addressDetected) {
-
-      /*
-       * Address is approximately:
-       * - hands below shoulders
-       * - hands above hips
-       * - body relatively stable
-       *
-       * We look for a stable period rather than
-       * automatically declaring the first 0.5 sec
-       * to be Address.
-       */
-
-      const recent = handHistory.filter(
-        p => now - p.time < 0.5
-      );
-
-      if (recent.length >= 5) {
-
-        let maxMovement = 0;
-
-        const first = recent[0];
-
-        for (const p of recent) {
-
-          const movement = Math.max(
-            Math.abs(p.x - first.x),
-            Math.abs(p.y - first.y)
-          );
-
-          maxMovement =
-            Math.max(maxMovement, movement);
-        }
-
-        const handsBelowShoulders =
-          handY > shoulderY;
-
-        const handsAboveHips =
-          handY < hipY;
-
-        const stable =
-          maxMovement < 0.012;
-
-        if (
-          stable &&
-          handsBelowShoulders &&
-          handsAboveHips
-        ) {
-
-          addressDetected = true;
-          addressTime = now;
-
-          // Start tracking the backswing
-          lastHandY = handY;
-        }
-      }
+  // --- Impact: hands return to about address height ---
+  let imp = -1;
+  for (let k = top + 1; k < S.length; k++) {
+    if (S[k].y >= ref.y - IMPACT_BAND * torso) {
+      imp = k;
+      break;
     }
+  }
+  if (imp < 0) {
+    return { phases, addressMeasurements, tempo: null, note: 'Found top of backswing but not impact.' };
+  }
+  phases.push({ key: 'impact', label: PHASE_LABELS.impact, t: S[imp].t, frame: S[imp].i });
 
-    // -----------------------------------------
-    // TOP OF BACKSWING
-    // -----------------------------------------
+  // --- Finish: highest hands within 2s after impact ---
+  let fin = imp;
+  for (let k = imp + 1; k < S.length && S[k].t - S[imp].t < 2; k++) {
+    if (S[k].y < S[fin].y) fin = k;
+  }
+  if (fin !== imp) {
+    phases.push({ key: 'finish', label: PHASE_LABELS.finish, t: S[fin].t, frame: S[fin].i });
+  }
 
-    if (
-      addressDetected &&
-      !topDetected
-    ) {
+  const back = S[top].t - S[a].t;
+  const down = S[imp].t - S[top].t;
+  const tempo = down > 0 ? { backswing: back, downswing: down, ratio: back / down } : null;
 
-      if (lastHandY !== null) {
+  return { phases, addressMeasurements, tempo, note: '' };
+}
 
-        // In image coordinates, smaller Y =
-        // hands moving upward.
-        const movingUp =
-          handY < lastHandY - 0.003;
+// ---------------------------------------------------------------------------
+// Drawing (reads stored data only)
+// ---------------------------------------------------------------------------
 
-        const movingDown =
-          handY > lastHandY + 0.003;
+// Size/position the canvas over the *rendered* video area (accounts for letterboxing).
+export function layoutCanvas(video, canvas) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = video.clientWidth, ch = video.clientHeight;
+  if (!vw || !vh || !cw || !ch) return { w: 0, h: 0 };
 
-        if (movingUp) {
+  const scale = Math.min(cw / vw, ch / vh);
+  const w = vw * scale, h = vh * scale;
+  const left = video.offsetLeft + (cw - w) / 2;
+  const top = video.offsetTop + (ch - h) / 2;
+  const dpr = window.devicePixelRatio || 1;
 
-          upwardMovementStarted = true;
+  const key = `${w}|${h}|${left}|${top}|${dpr}`;
+  if (canvas.dataset.layout !== key) {
+    canvas.dataset.layout = key;
+    canvas.style.left = `${left}px`;
+    canvas.style.top = `${top}px`;
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  canvas.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w, h };
+}
 
-          handHistory[handHistory.length - 1]
-            .movingUp = true;
-        }
+export function clearPose(canvas) {
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
 
-        /*
-         * Once the hands have clearly moved upward,
-         * a reversal downward indicates that the
-         * highest hand position was the Top.
-         */
+export function drawPose(video, canvas, analysis) {
+  const { w, h } = layoutCanvas(video, canvas);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  if (!w || !analysis?.frames?.length) return;
 
-        if (
-          upwardMovementStarted &&
-          movingDown
-        ) {
+  const idx = Math.min(
+    analysis.frames.length - 1,
+    Math.max(0, Math.round(video.currentTime * SAMPLE_FPS))
+  );
+  const L = analysis.frames[idx].lm;
 
-          // Look backward for the highest hand position
-          let highest = null;
+  // Skeleton
+  if (L) {
+    ctx.lineWidth = Math.max(2, w * 0.006);
+    ctx.strokeStyle = '#00ff66';
+    ctx.beginPath();
+    for (const [a, b] of CONNECTIONS) {
+      if (L[a].v < 0.3 || L[b].v < 0.3) continue;
+      ctx.moveTo(L[a].x * w, L[a].y * h);
+      ctx.lineTo(L[b].x * w, L[b].y * h);
+    }
+    ctx.stroke();
 
-          for (let i = handHistory.length - 1; i >= 0; i--) {
-
-            const p = handHistory[i];
-
-            if (now - p.time > 0.5) {
-              break;
-            }
-
-            if (
-              !highest ||
-              p.y < highest.y
-            ) {
-              highest = p;
-            }
-          }
-
-          if (highest) {
-
-            topDetected = true;
-            topTime = highest.time;
-          }
-        }
-      }
-
-      lastHandY = handY;
+    ctx.fillStyle = '#ff3b30';
+    for (let i = 11; i < L.length; i++) {
+      if (L[i].v < 0.3) continue;
+      ctx.beginPath();
+      ctx.arc(L[i].x * w, L[i].y * h, Math.max(3, w * 0.008), 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
-  // -----------------------------------------
-  // DRAW LOOP
-  // -----------------------------------------
+  // HUD
+  const now = video.currentTime + 0.5 / SAMPLE_FPS;
+  const current = analysis.phases.filter(p => p.t <= now).pop();
+  if (!current) return;
 
-  function drawLoop() {
+  const fs = Math.max(12, Math.round(w * 0.034));
+  const pad = fs * 0.5;
+  ctx.font = `600 ${fs}px -apple-system, Arial, sans-serif`;
+  ctx.textBaseline = 'top';
 
-    if (!poseLandmarker) return;
+  const box = (lines, y) => {
+    const width = Math.max(...lines.map(s => ctx.measureText(s).width)) + pad * 2;
+    const height = lines.length * fs * 1.35 + pad * 2 - fs * 0.35;
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    ctx.fillRect(10, y, width, height);
+    ctx.fillStyle = '#fff';
+    lines.forEach((s, n) => ctx.fillText(s, 10 + pad, y + pad + n * fs * 1.35));
+    return y + height + 8;
+  };
 
-    if (!video.paused) {
+  let y = 10;
+  y = box([`${current.label}  ${current.t.toFixed(2)}s`], y);
 
-      // Reset when replaying from beginning
-      if (
-        lastVideoTime >= 0 &&
-        video.currentTime <
-          lastVideoTime - 0.25
-      ) {
-        resetDetection();
-      }
-
-      lastVideoTime =
-        video.currentTime;
-
-      const result =
-        poseLandmarker.detectForVideo(
-          video,
-          performance.now()
-        );
-
-      ctx.clearRect(
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-
-      const landmarks =
-        result.landmarks?.[0];
-
-      if (landmarks) {
-
-        detectSwingPositions(
-          landmarks
-        );
-
-        const connections = [
-          [11,12],
-          [11,13],
-          [13,15],
-          [12,14],
-          [14,16],
-          [11,23],
-          [12,24],
-          [23,24],
-          [23,25],
-          [25,27],
-          [24,26],
-          [26,28],
-          [27,29],
-          [29,31],
-          [28,30],
-          [30,32]
-        ];
-
-        // Skeleton
-        ctx.strokeStyle = "#00ff00";
-        ctx.fillStyle = "#ff0000";
-        ctx.lineWidth = 4;
-
-        ctx.beginPath();
-
-        for (const [a, b] of connections) {
-
-          ctx.moveTo(
-            landmarks[a].x *
-              canvas.width,
-
-            landmarks[a].y *
-              canvas.height
-          );
-
-          ctx.lineTo(
-            landmarks[b].x *
-              canvas.width,
-
-            landmarks[b].y *
-              canvas.height
-          );
-        }
-
-        ctx.stroke();
-
-        for (const point of landmarks) {
-
-          ctx.beginPath();
-
-          ctx.arc(
-            point.x *
-              canvas.width,
-
-            point.y *
-              canvas.height,
-
-            5,
-            0,
-            Math.PI * 2
-          );
-
-          ctx.fill();
-        }
-      }
-
-      // Position labels
-      if (addressDetected) {
-            
-        drawLabel(
-          "ADDRESS  " +
-          getTime(addressTime),
-          15
-        );
-
-        const measurements =
-          calculateAddressMeasurements(landmarks);
-
-        drawMeasurementPanel(measurements);
-      }
-
-      if (topDetected) {
-
-        drawLabel(
-          "TOP OF BACKSWING  " +
-          getTime(topTime),
-          60
-        );
-      }
-    }
-
-    animationFrame =
-      requestAnimationFrame(
-        drawLoop
-      );
+  const m = analysis.addressMeasurements;
+  if (m) {
+    y = box(
+      [
+        'AT ADDRESS',
+        `Spine tilt ${m.spine.toFixed(0)}°`,
+        `Hips L/R ${m.leftHip.toFixed(0)}° / ${m.rightHip.toFixed(0)}°`,
+        `Knees L/R ${m.leftKnee.toFixed(0)}° / ${m.rightKnee.toFixed(0)}°`,
+      ],
+      y
+    );
   }
 
-
-  drawLoop();
+  const impact = analysis.phases.find(p => p.key === 'impact');
+  if (analysis.tempo && impact && now >= impact.t) {
+    box([`Tempo ${analysis.tempo.ratio.toFixed(1)} : 1`], y);
+  }
 }

@@ -20,6 +20,7 @@
       <button class="bigButton" data-view="Down the Line">📹<span>Down the Line</span><small>Camera behind the golfer</small></button>
       <button class="bigButton" data-view="Face On">📹<span>Face On</span><small>Camera facing the golfer</small></button>
     </div>
+    <button id="openSaved" class="primaryButton">Saved Swings</button>
     <div class="infoCard">
       <b>Prototype 1</b>
       <p>Record a swing, review the video, and place analysis lines and angles on any frame.</p>
@@ -41,6 +42,8 @@
     <div class="cameraControls">
       <p id="cameraStatus">Position yourself in the frame.</p>
       <button id="recordButton" class="recordButton"><span></span></button>
+      <button id="uploadButton" class="primaryButton">Upload Saved Swing</button>
+      <input id="videoPicker" type="file" accept="video/*" hidden>
       <div class="cameraHint">Tap to record • Tap again to stop</div>
     </div>
   </section>
@@ -55,6 +58,7 @@
       <div class="videoWrap" id="videoWrap">
         <video id="swingVideo" playsinline></video>
         <canvas id="overlay"></canvas>
+        <canvas id="poseOverlay"></canvas>
         <div id="emptyReview" class="emptyReview">Your swing will appear here.</div>
       </div>
       <div class="timeline">
@@ -78,6 +82,8 @@
 <button id="autoTrackingBtn" class="primaryButton">
   Enable Auto Tracking
 </button>
+<div id="trackingSummary" class="trackingSummary"></div>
+<div id="phaseRow" class="phaseRow"></div>
 
 <button id="saveSwing" class="primaryButton">
   Save Swing
@@ -94,7 +100,7 @@
   </section>
 </div>
 
-<script src="app.js?v=18"></script>
+<script src="app.js?v=19"></script>
 
 </body>
 </html>
