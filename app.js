@@ -6,6 +6,12 @@ let stream = null, recorder = null, chunks = [], recording = false;
 let videoUrl = null;                 // current blob URL (revoked when replaced)
 let tool = 'line', points = [];
 let currentBlob = null, currentSwingId = null;
+let club = {};                       // hand-marked shafts: { address|top|impact: { t, grip, head } } in 0..1 video coords
+let clubStep = null;                 // { key, part: 'grip'|'head', grip? } while marking
+let metrics = null;
+let selectedPhase = 'address';
+let videoFps = 30;                   // refined from playback timing below
+let saveTimer = null;
 let Store = null;                    // lazily imported store.js
 
 // Auto-tracking state
@@ -113,6 +119,10 @@ async function loadVideo(blob, opts = {}) {
   currentSwingId = opts.id || null;
 
   analysis = null;
+  club = opts.club || {};
+  clubStep = null;
+  metrics = null;
+  selectedPhase = 'address';
   if (Pose) Pose.clearPose(poseCanvas);
   resetTrackingUi();
   clearOverlay();
@@ -125,16 +135,18 @@ async function loadVideo(blob, opts = {}) {
   $('#playPause').textContent = '▶';
   show('review');
 
-  if (opts.analysis) {
+  updateClubUi();
+  if (opts.analysis || Object.keys(club).length) {
     try {
-      Pose = Pose || await import('./pose.js?v=10');
+      await ensurePose();
       if (videoUrl !== url) return; // another video was loaded meanwhile
-      analysis = opts.analysis;
+      analysis = opts.analysis || null;
+      if (analysis) $('#autoTrackingBtn').textContent = 'Re-run Tracking';
       renderPhases();
-      $('#autoTrackingBtn').textContent = 'Re-run Tracking';
+      refreshMetrics();
       redrawPose();
     } catch (e) {
-      console.error('Could not restore analysis', e);
+      console.error('Could not restore saved data', e);
     }
   }
 }
@@ -186,6 +198,7 @@ function pos(e) {
   return { x: e.clientX - r.left, y: e.clientY - r.top };
 }
 canvas.addEventListener('pointerdown', e => {
+  if (clubStep) { handleClubTap(e); return; }
   const needed = tool === 'line' ? 2 : 3;
   if (points.length >= needed) points = []; // a new tap starts a fresh measurement
   points.push(pos(e));
@@ -231,14 +244,33 @@ function clearOverlay() {
 
 // ------------------------------------------------------------- auto tracking
 function redrawPose() {
-  if (analyzing || !analysis || !Pose) return;
-  Pose.drawPose(swingVideo, poseCanvas, analysis);
+  if (analyzing || !Pose) return;
+  Pose.drawPose(swingVideo, poseCanvas, {
+    analysis, club, view: currentView, fps: videoFps,
+    pending: clubStep && clubStep.grip ? { grip: clubStep.grip } : null,
+  });
 }
 ['seeked', 'timeupdate', 'loadeddata', 'pause'].forEach(ev => swingVideo.addEventListener(ev, redrawPose));
 window.addEventListener('resize', redrawPose);
 if ('requestVideoFrameCallback' in swingVideo) {
   // Fires once per decoded frame, so the skeleton stays locked to playback.
-  const loop = () => { redrawPose(); swingVideo.requestVideoFrameCallback(loop); };
+  // While playing, consecutive frame timestamps tell us the clip's real frame rate (used by the frame-step buttons).
+  let lastMedia = null, lastPresented = null;
+  const deltas = [];
+  const loop = (now, meta) => {
+    if (!swingVideo.paused && lastMedia !== null && meta.presentedFrames - lastPresented === 1) {
+      const d = meta.mediaTime - lastMedia;
+      if (d > 0.001 && d < 0.1) {
+        deltas.push(d);
+        if (deltas.length > 31) deltas.shift();
+        if (deltas.length >= 8) videoFps = 1 / [...deltas].sort((x, y) => x - y)[deltas.length >> 1];
+      }
+    }
+    lastMedia = meta.mediaTime;
+    lastPresented = meta.presentedFrames;
+    redrawPose();
+    swingVideo.requestVideoFrameCallback(loop);
+  };
   swingVideo.requestVideoFrameCallback(loop);
 }
 
@@ -247,32 +279,168 @@ function resetTrackingUi() {
   btn.disabled = false;
   btn.textContent = 'Enable Auto Tracking';
   $('#trackingSummary').textContent = '';
-  $('#phaseRow').innerHTML = '';
-  $('#metricsTable').innerHTML = '';
+  renderPhases();
+  renderMetrics();
+}
+
+const PHASE_KEYS = [['address', 'Address'], ['top', 'Top'], ['impact', 'Impact'], ['finish', 'Finish']];
+
+async function ensurePose() { return Pose || (Pose = await import('./pose.js?v=11')); }
+
+// Phases can be set by hand before (or without) tracking, so keep a stub analysis around when needed.
+function ensureAnalysis() {
+  if (!analysis) {
+    analysis = {
+      frames: [], phases: [], tempo: null, note: '', view: currentView,
+      aspect: swingVideo.videoWidth ? swingVideo.videoWidth / swingVideo.videoHeight : 1,
+    };
+  }
+  return analysis;
 }
 
 function renderPhases() {
   const row = $('#phaseRow');
   row.innerHTML = '';
-  analysis.phases.forEach(p => {
+  PHASE_KEYS.forEach(([key, label]) => {
+    const p = analysis && analysis.phases.find(x => x.key === key);
     const b = document.createElement('button');
-    b.className = 'phaseButton';
-    b.textContent = p.key === 'top' ? 'Top' : p.label[0] + p.label.slice(1).toLowerCase();
+    b.className = 'phaseButton' + (p ? '' : ' missing') + (selectedPhase === key ? ' selected' : '') + (p && p.manual ? ' manual' : '');
+    b.textContent = label;
     b.onclick = () => {
+      selectedPhase = key;
       swingVideo.pause();
       $('#playPause').textContent = '▶';
-      swingVideo.currentTime = p.t;
+      if (p) swingVideo.currentTime = p.t;
+      renderPhases();
     };
     row.appendChild(b);
   });
+  const label = PHASE_KEYS.find(k => k[0] === selectedPhase)[1];
+  $('#setPhase').textContent = `Set ${label} to this frame`;
 
   const parts = [];
-  if (analysis.tempo) {
+  if (analysis && analysis.tempo) {
     parts.push(`Tempo ${analysis.tempo.ratio.toFixed(1)}:1 (backswing ${analysis.tempo.backswing.toFixed(2)}s, downswing ${analysis.tempo.downswing.toFixed(2)}s)`);
   }
-  if (analysis.note) parts.push(analysis.note);
+  if (analysis && analysis.note) parts.push(analysis.note);
   $('#trackingSummary').textContent = parts.join(' • ');
+}
+
+function stepFrame(dir) {
+  if (!swingVideo.getAttribute('src')) return;
+  swingVideo.pause();
+  $('#playPause').textContent = '▶';
+  const n = Math.floor(swingVideo.currentTime * videoFps + 1e-3) + dir;
+  swingVideo.currentTime = Math.min(swingVideo.duration || 0, Math.max(0, (n + 0.5) / videoFps)); // aim for mid-frame
+}
+$('#stepBack').onclick = () => stepFrame(-1);
+$('#stepFwd').onclick = () => stepFrame(1);
+
+$('#setPhase').onclick = async () => {
+  if (!swingVideo.getAttribute('src')) return;
+  swingVideo.pause();
+  $('#playPause').textContent = '▶';
+  await ensurePose();
+  ensureAnalysis();
+  Pose.setPhase(analysis, selectedPhase, swingVideo.currentTime);
+  renderPhases();
+  refreshMetrics();
+  redrawPose();
+  queueSave();
+};
+
+// ---------------------------------------------------------------- club marking
+function updateClubUi() {
+  const row = $('#clubRow');
+  row.innerHTML = '';
+  PHASE_KEYS.slice(0, 3).forEach(([key, label]) => {
+    const b = document.createElement('button');
+    b.className = 'phaseButton' + (clubStep && clubStep.key === key ? ' selected' : '');
+    b.textContent = (club[key] ? '✓ ' : '') + label;
+    b.onclick = () => toggleClubStep(key);
+    row.appendChild(b);
+  });
+  const clr = document.createElement('button');
+  clr.className = 'phaseButton danger';
+  clr.textContent = 'Clear';
+  clr.onclick = clearClub;
+  row.appendChild(clr);
+
+  $('#clubHelp').textContent = !clubStep
+    ? 'Pick a position, then tap the grip end and the club head on that frame.'
+    : clubStep.part === 'grip'
+      ? 'Tap the grip end of the club (top of the handle).'
+      : 'Now tap the club head.';
+}
+
+async function toggleClubStep(key) {
+  if (!swingVideo.getAttribute('src')) { alert('Record or upload a swing first.'); return; }
+  if (clubStep && clubStep.key === key) { clubStep = null; updateClubUi(); redrawPose(); return; } // tap again to cancel
+  await ensurePose();
+  swingVideo.pause();
+  $('#playPause').textContent = '▶';
+  const p = analysis && analysis.phases.find(x => x.key === key);
+  if (p) swingVideo.currentTime = p.t;
+  clubStep = { key, part: 'grip' };
+  updateClubUi();
+  redrawPose();
+}
+
+function handleClubTap(e) {
+  const r = poseCanvas.getBoundingClientRect(); // this canvas sits exactly over the video image
+  if (!r.width || !r.height) return;
+  const x = (e.clientX - r.left) / r.width;
+  const y = (e.clientY - r.top) / r.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+
+  if (clubStep.part === 'grip') {
+    clubStep.grip = { x, y };
+    clubStep.part = 'head';
+    updateClubUi();
+    redrawPose();
+    return;
+  }
+  club[clubStep.key] = { t: swingVideo.currentTime, grip: clubStep.grip, head: { x, y } };
+  clubStep = null;
+  clubChanged();
+}
+
+function clearClub() {
+  club = {};
+  clubStep = null;
+  clubChanged();
+}
+
+function clubChanged() {
+  updateClubUi();
+  refreshMetrics();
+  redrawPose();
+  queueSave();
+}
+
+function refreshMetrics() {
+  if (!Pose) { metrics = null; renderMetrics(); return; }
+  const aspect = swingVideo.videoWidth ? swingVideo.videoWidth / swingVideo.videoHeight : (analysis && analysis.aspect) || 1;
+  metrics = Pose.computeMetrics({
+    frames: analysis ? analysis.frames : [],
+    phases: analysis ? analysis.phases : [],
+    view: currentView, club, aspect,
+  });
   renderMetrics();
+}
+swingVideo.addEventListener('loadedmetadata', refreshMetrics);
+
+// Auto-save edits to a swing that's already been saved (debounced).
+function queueSave() {
+  if (!currentSwingId) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    if (!currentSwingId || !currentBlob) return;
+    try {
+      const st = await getStore();
+      await st.saveSwing({ id: currentSwingId, blob: currentBlob, analysis, club });
+    } catch (e) { console.error('Auto-save failed', e); }
+  }, 600);
 }
 
 $('#autoTrackingBtn').onclick = async () => {
@@ -287,20 +455,21 @@ $('#autoTrackingBtn').onclick = async () => {
   Pose?.clearPose(poseCanvas);
 
   try {
-    Pose = Pose || await import('./pose.js?v=10');
+    Pose = Pose || await import('./pose.js?v=11');
     btn.textContent = 'Loading model… (tap to cancel)';
+    const previous = analysis;
     analysis = await Pose.analyzeVideo(swingVideo, {
       view: currentView,
       signal: analysisAbort.signal,
       onProgress: (p, msg) => { btn.textContent = `${msg} ${Math.round(p * 100)}% (tap to cancel)`; },
     });
+    Pose.keepManualPhases(analysis, previous);
     analyzing = false;
     renderPhases();
+    refreshMetrics();
     redrawPose();
     btn.textContent = 'Re-run Tracking';
-    if (currentSwingId) { // keep an already-saved swing's analysis up to date
-      getStore().then(st => st.saveSwing({ id: currentSwingId, blob: currentBlob, analysis })).catch(console.error);
-    }
+    queueSave(); // keep an already-saved swing up to date
   } catch (error) {
     if (error.name !== 'AbortError') {
       console.error('Automatic tracking failed:', error);
@@ -317,7 +486,7 @@ $('#autoTrackingBtn').onclick = async () => {
 // ------------------------------------------------------------------- metrics
 function renderMetrics() {
   const el = $('#metricsTable');
-  const m = analysis && analysis.metrics;
+  const m = metrics;
   if (!m || !m.rows.length) { el.innerHTML = ''; return; }
   const cols = [['address', 'Address'], ['top', 'Top'], ['impact', 'Impact']];
   const cell = (row, k) => {
@@ -335,7 +504,7 @@ function renderMetrics() {
 }
 
 // -------------------------------------------------------------- saved swings
-async function getStore() { return Store || (Store = await import('./store.js?v=1')); }
+async function getStore() { return Store || (Store = await import('./store.js?v=2')); }
 
 $('#saveSwing').onclick = async () => {
   if (!currentBlob) { alert('Nothing to save yet.'); return; }
@@ -348,7 +517,7 @@ $('#saveSwing').onclick = async () => {
   btn.disabled = true;
   try {
     const st = await getStore();
-    const meta = await st.saveSwing({ id: currentSwingId, name, view: currentView, blob: currentBlob, analysis });
+    const meta = await st.saveSwing({ id: currentSwingId, name, view: currentView, blob: currentBlob, analysis, club });
     currentSwingId = meta.id;
     btn.textContent = 'Update Saved Swing';
     st.requestPersistence();
@@ -412,7 +581,7 @@ $('#savedList').addEventListener('click', async e => {
       const rec = await st.getSwing(id);
       if (!rec || !rec.blob) { alert('No video is stored for this swing.'); return; }
       currentView = rec.meta.view || currentView;
-      await loadVideo(rec.blob, { id, analysis: rec.analysis });
+      await loadVideo(rec.blob, { id, analysis: rec.analysis, club: rec.club });
     } else if (confirm('Delete this saved swing?')) {
       await st.deleteSwing(id);
       if (currentSwingId === id) { currentSwingId = null; $('#saveSwing').textContent = 'Save Swing'; }
@@ -427,3 +596,8 @@ $('#savedList').addEventListener('click', async e => {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
 }
+
+// initial UI
+renderPhases();
+updateClubUi();
+renderMetrics();

@@ -38,7 +38,7 @@ const txDone = tx =>
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 // Create or update a swing. Passing an existing id keeps its name/date unless overridden.
-export async function saveSwing({ id, name, view, blob, analysis }) {
+export async function saveSwing({ id, name, view, blob, analysis, club }) {
   const d = await db();
   const old = id ? await wrap(d.transaction('meta').objectStore('meta').get(id)) : null;
   const meta = {
@@ -54,7 +54,7 @@ export async function saveSwing({ id, name, view, blob, analysis }) {
   };
   const tx = d.transaction(['meta', 'data'], 'readwrite');
   tx.objectStore('meta').put(meta);
-  tx.objectStore('data').put({ id: meta.id, blob, analysis: analysis || null });
+  tx.objectStore('data').put({ id: meta.id, blob, analysis: analysis || null, club: club || null });
   await txDone(tx);
   return meta;
 }
@@ -83,7 +83,7 @@ export async function getSwing(id) {
     wrap(tx.objectStore('meta').get(id)),
     wrap(tx.objectStore('data').get(id)),
   ]);
-  return meta ? { meta, blob: data?.blob || null, analysis: data?.analysis || null } : null;
+  return meta ? { meta, blob: data?.blob || null, analysis: data?.analysis || null, club: data?.club || null } : null;
 }
 
 export async function deleteSwing(id) {
