@@ -83,3 +83,9 @@ header p{margin:0;color:var(--muted);line-height:1.45}
 .adjustBar .wide{flex:1}
 .clubCard{margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
 .clubCard p{margin:4px 0 0;font-size:13px;color:var(--muted);line-height:1.4}
+
+.handRow{display:flex;align-items:center;gap:10px;margin-top:15px;font-size:14px;color:var(--muted)}
+.handRow select{flex:1;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--card);font:inherit;color:var(--text)}
+.phaseRow .phaseButton{padding:7px 10px;font-size:14px}
+.phaseButton.estimated{font-style:italic}
+.tableScroll{overflow-x:auto}

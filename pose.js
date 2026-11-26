@@ -26,12 +26,20 @@ const CONNECTIONS = [
   [27, 29], [29, 31], [28, 30], [30, 32],
 ];
 
-const PHASE_LABELS = {
-  address: 'ADDRESS',
-  top: 'TOP OF BACKSWING',
-  impact: 'IMPACT',
-  finish: 'FINISH',
+const PHASE_NAMES = {
+  P1: 'Address',
+  P2: 'Shaft parallel (back)',
+  P3: 'Lead arm parallel (back)',
+  P4: 'Top of backswing',
+  P5: 'Lead arm parallel (down)',
+  P6: 'Shaft parallel (down)',
+  P7: 'Impact',
+  P8: 'Shaft parallel (through)',
+  P9: 'Lead arm parallel (through)',
+  P10: 'Finish',
 };
+const CORE = ['P1', 'P4', 'P7', 'P10'];   // always kept; the rest are dropped if they land out of order
+const P2_FRACTION = 0.35;                 // P2/P6/P8 estimate: hands this far up from address toward P3 height
 
 // ---------------------------------------------------------------------------
 // Model loading (cached; GPU first, CPU fallback)
@@ -79,7 +87,7 @@ function seekTo(video, t) {
   });
 }
 
-export async function analyzeVideo(video, { view = '', onProgress = () => {}, signal } = {}) {
+export async function analyzeVideo(video, { view = '', lefty = false, onProgress = () => {}, signal } = {}) {
   if (!video.videoWidth || !isFinite(video.duration)) {
     throw new Error(
       'This video has no readable duration (some recorded WebM files lack it). Try an uploaded MP4/MOV.'
@@ -121,7 +129,7 @@ export async function analyzeVideo(video, { view = '', onProgress = () => {}, si
 
   onProgress(1, 'Analyzing');
   const aspect = video.videoWidth / video.videoHeight;
-  return { frames, view, aspect, ...analyzeSwing(frames, view, aspect) };
+  return { frames, view, lefty, aspect, ...analyzeSwing(frames, view, aspect, lefty) };
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +141,9 @@ const median = a => {
   return s[Math.floor(s.length / 2)];
 };
 
-function buildSamples(frames, aspect = 1) {
+function buildSamples(frames, aspect = 1, lefty = false) {
+  // Lead side = left for a right-handed golfer. (MediaPipe landmarks: 11/15 = left shoulder/wrist, 12/16 = right.)
+  const LS = lefty ? 12 : 11, LW = lefty ? 16 : 15;
   const raw = [];
   frames.forEach((f, i) => {
     const L = f.lm;
@@ -151,19 +161,20 @@ function buildSamples(frames, aspect = 1) {
       shoulderY,
       hipY,
       torso: Math.max(0.05, hipY - shoulderY),
+      lsy: L[LS].y, // lead shoulder height
+      lwy: L[LW].y, // lead wrist height
     });
   });
 
   // 5-sample moving average to kill landmark jitter
   const W = 2;
   return raw.map((p, k) => {
-    let sx = 0, sy = 0, c = 0;
+    let sx = 0, sy = 0, sl = 0, sw = 0, c = 0;
     for (let j = Math.max(0, k - W); j <= Math.min(raw.length - 1, k + W); j++) {
-      sx += raw[j].x;
-      sy += raw[j].y;
+      sx += raw[j].x; sy += raw[j].y; sl += raw[j].lsy; sw += raw[j].lwy;
       c++;
     }
-    return { ...p, x: sx / c, y: sy / c };
+    return { ...p, x: sx / c, y: sy / c, lsy: sl / c, lwy: sw / c };
   });
 }
 
@@ -182,7 +193,8 @@ const deg = r => (r * 180) / Math.PI;
 const lerp = (a, b, u) => a + (b - a) * u;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-export const PHASE_ORDER = ['address', 'top', 'impact', 'finish'];
+export const PHASE_ORDER = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9', 'P10'];
+const LEGACY_KEYS = { address: 'P1', top: 'P4', impact: 'P7', finish: 'P10' };
 
 // ---- phases -------------------------------------------------------------
 function nearestFrame(frames, t) {
@@ -194,13 +206,14 @@ function nearestFrame(frames, t) {
   return c;
 }
 
-export function makePhase(key, t, frames, manual = false) {
-  return { key, label: PHASE_LABELS[key], t, frame: nearestFrame(frames, t), manual };
+export function makePhase(key, t, frames, manual = false, estimated = false) {
+  return { key, label: `${key} ${PHASE_NAMES[key]}`, t, frame: nearestFrame(frames, t), manual, estimated };
 }
 
+// Tempo = P1→P4 (backswing) over P4→P7 (downswing).
 export function tempoFromPhases(phases) {
   const get = k => phases.find(p => p.key === k);
-  const a = get('address'), top = get('top'), imp = get('impact');
+  const a = get('P1'), top = get('P4'), imp = get('P7');
   if (!a || !top || !imp) return null;
   const back = top.t - a.t, down = imp.t - top.t;
   return back > 0 && down > 0 ? { backswing: back, downswing: down, ratio: back / down } : null;
@@ -208,7 +221,7 @@ export function tempoFromPhases(phases) {
 
 // Move (or create) a phase by hand. Manual phases survive a tracking re-run.
 export function setPhase(analysis, key, t) {
-  const phase = makePhase(key, t, analysis.frames, true);
+  const phase = makePhase(key, t, analysis.frames, true, false);
   const i = analysis.phases.findIndex(p => p.key === key);
   if (i >= 0) analysis.phases[i] = phase; else analysis.phases.push(phase);
   analysis.phases.sort((x, y) => PHASE_ORDER.indexOf(x.key) - PHASE_ORDER.indexOf(y.key));
@@ -217,6 +230,18 @@ export function setPhase(analysis, key, t) {
 
 export function keepManualPhases(analysis, previous) {
   for (const p of previous?.phases || []) if (p.manual) setPhase(analysis, p.key, p.t);
+}
+
+// Saved swings from before the P-system used address/top/impact/finish. Rename in place.
+export function migrateLegacy(analysis, club) {
+  for (const p of analysis?.phases || []) {
+    if (LEGACY_KEYS[p.key]) { p.key = LEGACY_KEYS[p.key]; p.label = `${p.key} ${PHASE_NAMES[p.key]}`; }
+  }
+  if (club) {
+    for (const [old, key] of Object.entries(LEGACY_KEYS)) {
+      if (club[old]) { club[key] = club[old]; delete club[old]; }
+    }
+  }
 }
 
 // ---- body metrics (inputs are landmarks already scaled to true pixel proportions) ----
@@ -242,19 +267,20 @@ const scaleLm = (lm, A) => lm.map(p => ({ x: p.x * A, y: p.y, v: p.v }));
 // Metrics depend on the camera view: each view can only measure what it can actually see in 2D.
 //  Down the Line (side-on): spine angle, knee flex, head height, plane line, hands vs plane.
 //  Face On: shoulder tilt, hip/head shift toward the target, stance width, shaft lean.
-// `club` holds hand-marked shafts: { address|top|impact: { t, grip:{x,y}, head:{x,y} } } in 0..1 video coords.
+// Body metrics are taken at P1, P4 and P7. Club metrics at any P-position you've marked:
+// `club` = { P1..P10: { t, grip:{x,y}, head:{x,y} } } in 0..1 video coords.
 export function computeMetrics({ frames = [], phases = [], view = '', club = null, aspect = 1 }) {
   const A = aspect || 1; // landmarks/marks are 0..1 per axis; x must be scaled by aspect before measuring angles
-  const KEYS = ['address', 'top', 'impact'];
+  const BODY = ['P1', 'P4', 'P7'];
 
   const at = {};
   for (const p of phases) {
-    if (!KEYS.includes(p.key)) continue;
+    if (!BODY.includes(p.key)) continue;
     const lm = frames[p.frame]?.lm;
     if (lm) at[p.key] = scaleLm(lm, A);
   }
   const marks = {};
-  for (const k of KEYS) {
+  for (const k of PHASE_ORDER) {
     const c = club?.[k];
     if (c?.grip && c?.head) {
       marks[k] = { grip: { x: c.grip.x * A, y: c.grip.y }, head: { x: c.head.x * A, y: c.head.y } };
@@ -266,7 +292,7 @@ export function computeMetrics({ frames = [], phases = [], view = '', club = nul
   const addRow = (label, unit, values, signed = false) => {
     if (Object.keys(values).length) rows.push({ label, unit, values, signed });
   };
-  const poseRow = (label, unit, fn, keys = KEYS, signed = false) => {
+  const poseRow = (label, unit, fn, keys = BODY, signed = false) => {
     const values = {};
     for (const k of keys) {
       if (!at[k]) continue;
@@ -275,7 +301,7 @@ export function computeMetrics({ frames = [], phases = [], view = '', club = nul
     }
     addRow(label, unit, values, signed);
   };
-  const clubRow = (label, unit, fn, keys = KEYS, signed = false) => {
+  const clubRow = (label, unit, fn, keys = PHASE_ORDER, signed = false) => {
     const values = {};
     for (const k of keys) {
       if (!marks[k]) continue;
@@ -287,9 +313,9 @@ export function computeMetrics({ frames = [], phases = [], view = '', club = nul
 
   // Target direction isn't known, so infer it: hips move toward the target going into impact.
   let dir = null;
-  if (at.top && at.impact) dir = mid(at.impact[23], at.impact[24]).x >= mid(at.top[23], at.top[24]).x ? 1 : -1;
+  if (at.P4 && at.P7) dir = mid(at.P7[23], at.P7[24]).x >= mid(at.P4[23], at.P4[24]).x ? 1 : -1;
 
-  const base = at.address;
+  const base = at.P1;
   const noseOk = L => L[0] && L[0].v >= 0.3;
   if (base) {
     if (view === 'Face On') {
@@ -298,19 +324,19 @@ export function computeMetrics({ frames = [], phases = [], view = '', club = nul
         const hipX = L => mid(L[23], L[24]).x;
         poseRow('Shoulder tilt', '°', shoulderTilt);
         if (dir !== null) {
-          poseRow('Hip shift', '% of shoulder width', L => ((hipX(L) - hipX(base)) * dir / sw) * 100, ['top', 'impact'], true);
+          poseRow('Hip shift', '% of shoulder width', L => ((hipX(L) - hipX(base)) * dir / sw) * 100, ['P4', 'P7'], true);
           poseRow('Head shift', '% of shoulder width',
-            L => (noseOk(L) && noseOk(base) ? ((L[0].x - base[0].x) * dir / sw) * 100 : null), ['top', 'impact'], true);
+            L => (noseOk(L) && noseOk(base) ? ((L[0].x - base[0].x) * dir / sw) * 100 : null), ['P4', 'P7'], true);
         }
-        poseRow('Stance width', '% of shoulder width', L => (dist(L[27], L[28]) / sw) * 100, ['address']);
+        poseRow('Stance width', '% of shoulder width', L => (dist(L[27], L[28]) / sw) * 100, ['P1']);
       }
     } else {
       const torso = dist(mid(base[11], base[12]), mid(base[23], base[24]));
       poseRow('Spine angle', '° from vertical', spineAngle);
-      poseRow('Knee flex', '° (0 = straight)', kneeFlex, ['address', 'impact']);
+      poseRow('Knee flex', '° (0 = straight)', kneeFlex, ['P1', 'P7']);
       if (torso > 0.03) {
         poseRow('Head height', '% of torso, + = higher',
-          L => (noseOk(L) && noseOk(base) ? ((base[0].y - L[0].y) / torso) * 100 : null), ['top', 'impact'], true);
+          L => (noseOk(L) && noseOk(base) ? ((base[0].y - L[0].y) / torso) * 100 : null), ['P4', 'P7'], true);
       }
     }
   }
@@ -318,23 +344,23 @@ export function computeMetrics({ frames = [], phases = [], view = '', club = nul
 
   // ---- club metrics from hand-marked shafts ----
   const elev = m => deg(Math.atan2(m.grip.y - m.head.y, Math.abs(m.head.x - m.grip.x))); // head above hands = +
-  clubRow('Shaft angle', '° above horizontal', elev, KEYS, true);
+  clubRow('Shaft angle', '° above horizontal', elev, PHASE_ORDER, true);
 
   if (view === 'Face On') {
     if (dir !== null) {
-      clubRow('Shaft lean', '° toward target', m => deg(Math.atan2((m.grip.x - m.head.x) * dir, m.head.y - m.grip.y)), ['address', 'impact'], true);
+      clubRow('Shaft lean', '° toward target', m => deg(Math.atan2((m.grip.x - m.head.x) * dir, m.head.y - m.grip.y)), ['P1', 'P7'], true);
     }
-  } else if (marks.address) {
-    const { grip: g, head: h } = marks.address;
+  } else if (marks.P1) {
+    const { grip: g, head: h } = marks.P1;
     const dx = g.x - h.x, dy = g.y - h.y, len = Math.hypot(dx, dy);
-    addRow('Plane line angle', '° from horizontal', { address: deg(Math.atan2(Math.abs(dy), Math.abs(dx))) });
+    addRow('Plane line angle', '° from horizontal', { P1: deg(Math.atan2(Math.abs(dy), Math.abs(dx))) });
     if (len > 0.02 && Math.abs(dx) > 1e-4) {
       clubRow('Hands vs address plane', '% of shaft length, + = above', m => {
         const P = m.grip;
         const yLine = h.y + (dy / dx) * (P.x - h.x);
         const perp = Math.abs(dx * (P.y - h.y) - dy * (P.x - h.x)) / len;
         return (P.y < yLine ? 1 : -1) * (perp / len) * 100;
-      }, ['top', 'impact'], true);
+      }, PHASE_ORDER.slice(1), true);
     }
   }
 
@@ -351,15 +377,38 @@ function refinePeak(S, k) {
   return S[k].t + clamp((ya - yc) / (2 * den), -1, 1) / SAMPLE_FPS;
 }
 
-export function analyzeSwing(frames, view = '', aspect = 1) {
+// Lead arm "parallel to the ground" = lead wrist passes through lead shoulder height.
+function armParallel(S, from, to, rising) {
+  for (let k = Math.max(1, from + 1); k <= to; k++) {
+    const d0 = S[k - 1].lwy - S[k - 1].lsy, d1 = S[k].lwy - S[k].lsy; // + = wrist below shoulder
+    if (rising ? d0 > 0 && d1 <= 0 : d0 <= 0 && d1 > 0) {
+      const u = clamp(d0 / (d0 - d1), 0, 1);
+      return { t: lerp(S[k - 1].t, S[k].t, u), y: lerp(S[k - 1].y, S[k].y, u) };
+    }
+  }
+  return null;
+}
+
+// First time the hands pass through a given height (up = moving up the screen).
+function levelCross(S, from, to, level, up) {
+  for (let k = Math.max(1, from + 1); k <= to; k++) {
+    const y0 = S[k - 1].y, y1 = S[k].y;
+    if (up ? y0 > level && y1 <= level : y0 < level && y1 >= level) {
+      return lerp(S[k - 1].t, S[k].t, clamp((level - y0) / (y1 - y0), 0, 1));
+    }
+  }
+  return null;
+}
+
+export function analyzeSwing(frames, view = '', aspect = 1, lefty = false) {
   const empty = { phases: [], tempo: null, note: '' };
-  const S = buildSamples(frames, aspect);
+  const S = buildSamples(frames, aspect, lefty);
   if (S.length < 10) {
     return { ...empty, note: 'Could not see the golfer clearly enough. Check framing and lighting.' };
   }
   const torso = median(S.map(p => p.torso));
 
-  // --- Address: first stretch where the hands are still and in a sensible place ---
+  // --- P1 Address: first stretch where the hands are still and in a sensible place ---
   let ref = null;
   for (let s = 0; s < S.length; s++) {
     let e = s;
@@ -393,10 +442,24 @@ export function analyzeSwing(frames, view = '', aspect = 1) {
     a++;
   }
 
-  const phases = [makePhase('address', S[a].t, frames)];
-  const done = note => ({ phases, tempo: tempoFromPhases(phases), note });
+  // Candidates by position; est = estimated rather than directly detected.
+  const cand = { P1: { t: S[a].t } };
+  const finalize = note => {
+    const phases = [];
+    let prevT = -Infinity;
+    PHASE_ORDER.forEach((key, i) => {
+      const c = cand[key];
+      if (!c) return;
+      const nextCore = PHASE_ORDER.slice(i + 1).find(k => CORE.includes(k) && cand[k]);
+      const upper = nextCore ? cand[nextCore].t : Infinity;
+      if (!CORE.includes(key) && !(c.t > prevT && c.t < upper)) return; // out of order: drop it
+      phases.push(makePhase(key, c.t, frames, false, !!c.est));
+      prevT = c.t;
+    });
+    return { phases, tempo: tempoFromPhases(phases), note };
+  };
 
-  // --- Top: hysteresis. Hands rise TOP_RISE above address, then drop TOP_DROP from the peak ---
+  // --- P4 Top: hysteresis. Hands rise TOP_RISE above address, then drop TOP_DROP from the peak ---
   let peak = a, armed = false, top = -1;
   for (let k = a + 1; k < S.length; k++) {
     if (S[k].y < S[peak].y) peak = k;
@@ -406,10 +469,17 @@ export function analyzeSwing(frames, view = '', aspect = 1) {
       break;
     }
   }
-  if (top < 0) return done('Found address but no complete backswing.');
-  phases.push(makePhase('top', refinePeak(S, top), frames));
+  if (top < 0) return finalize('Found address but no complete backswing.');
+  cand.P4 = { t: refinePeak(S, top) };
 
-  // --- Impact: the lowest point of the hands in the downswing (sub-frame refined) ---
+  // --- P3 lead arm parallel (back). P2 shaft parallel is estimated from hand height ---
+  const p3 = armParallel(S, a, top, true);
+  if (p3) cand.P3 = { t: p3.t };
+  const level2 = p3 ? ref.y - P2_FRACTION * (ref.y - p3.y) : ref.y - 0.2 * (ref.y - S[top].y);
+  const p2 = levelCross(S, a, top, level2, true);
+  if (p2 !== null) cand.P2 = { t: p2, est: true };
+
+  // --- P7 Impact: the lowest point of the hands in the downswing (sub-frame refined) ---
   // Mirror image of the top: find the low point, confirm once the hands rise again in the follow-through.
   const fullDrop = ref.y - S[top].y;
   let low = top + 1, imp = -1;
@@ -420,17 +490,27 @@ export function analyzeSwing(frames, view = '', aspect = 1) {
   }
   // Clip may end right at impact, with no follow-through to confirm it.
   if (imp < 0 && S[low].y - S[top].y >= IMPACT_DESCENT * fullDrop) imp = low;
-  if (imp < 0) return done('Found top of backswing but not impact.');
-  phases.push(makePhase('impact', refinePeak(S, imp), frames));
+  if (imp < 0) return finalize('Found top of backswing but not impact.');
+  cand.P7 = { t: refinePeak(S, imp) };
 
-  // --- Finish: highest hands within 2s after impact ---
+  // --- P5 lead arm parallel (down), P6 shaft parallel (down, estimated) ---
+  const p5 = armParallel(S, top, imp, false);
+  if (p5) cand.P5 = { t: p5.t };
+  const p6 = levelCross(S, top, imp, level2, false);
+  if (p6 !== null) cand.P6 = { t: p6, est: true };
+
+  // --- P10 Finish: highest hands within 2s after impact. P9 lead arm parallel, P8 shaft parallel (estimated) ---
   let fin = imp;
   for (let k = imp + 1; k < S.length && S[k].t - S[imp].t < 2; k++) {
     if (S[k].y < S[fin].y) fin = k;
   }
-  if (fin !== imp) phases.push(makePhase('finish', S[fin].t, frames));
+  const p9 = armParallel(S, imp, fin, true);
+  if (p9) cand.P9 = { t: p9.t };
+  const p8 = levelCross(S, imp, fin, level2, true);
+  if (p8 !== null) cand.P8 = { t: p8, est: true };
+  if (fin !== imp) cand.P10 = { t: S[fin].t };
 
-  return done('');
+  return finalize('');
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +565,7 @@ export function drawPose(video, canvas, { analysis = null, club = null, pending 
 
 // Path of the hands from address up to the current frame.
 function drawTrail(ctx, w, h, frames, phases, idx) {
-  const addr = phases.find(p => p.key === 'address');
+  const addr = phases.find(p => p.key === 'P1');
   const start = Math.max(0, addr ? addr.frame : 0);
   ctx.save();
   ctx.strokeStyle = 'rgba(255,214,10,0.9)';
@@ -533,7 +613,7 @@ function drawClub(ctx, w, h, video, club, pending, view, fps) {
     if (fill) ctx.fill(); else ctx.stroke();
   };
 
-  const A = club?.address;
+  const A = club?.P1;
   if (view !== 'Face On' && A?.grip && A?.head) {
     const [gx, gy] = P(A.grip), [hx, hy] = P(A.head);
     const dx = gx - hx, dy = gy - hy, len = Math.hypot(dx, dy);
@@ -556,7 +636,7 @@ function drawClub(ctx, w, h, video, club, pending, view, fps) {
   ctx.strokeStyle = '#32d2ff';
   ctx.fillStyle = '#32d2ff';
   ctx.lineWidth = lw;
-  for (const key of ['address', 'top', 'impact']) {
+  for (const key of PHASE_ORDER) {
     const m = club?.[key];
     if (!m?.grip || !m?.head || Math.abs(video.currentTime - m.t) > tol) continue;
     const [gx, gy] = P(m.grip), [hx, hy] = P(m.head);
@@ -597,7 +677,7 @@ function drawHud(ctx, w, video, analysis) {
 
   let y = 10;
   y = box([`${current.label}  ${current.t.toFixed(2)}s`], y);
-  const impact = analysis.phases.find(p => p.key === 'impact');
+  const impact = analysis.phases.find(p => p.key === 'P7');
   if (analysis.tempo && impact && now >= impact.t) {
     box([`Tempo ${analysis.tempo.ratio.toFixed(1)} : 1`], y);
   }

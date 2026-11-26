@@ -9,7 +9,7 @@ let currentBlob = null, currentSwingId = null;
 let club = {};                       // hand-marked shafts: { address|top|impact: { t, grip, head } } in 0..1 video coords
 let clubStep = null;                 // { key, part: 'grip'|'head', grip? } while marking
 let metrics = null;
-let selectedPhase = 'address';
+let selectedPhase = 'P1';
 let videoFps = 30;                   // refined from playback timing below
 let saveTimer = null;
 let Store = null;                    // lazily imported store.js
@@ -22,6 +22,14 @@ let analyzing = false;
 
 const swingVideo = $('#swingVideo');
 const poseCanvas = $('#poseOverlay');
+
+// Golfer handedness decides which arm is the "lead" arm (P3, P5, P9). Saved as a simple preference.
+const handSelect = $('#handSelect');
+try { handSelect.value = localStorage.getItem('gsa_hand') || 'right'; } catch (e) { /* storage blocked */ }
+handSelect.onchange = () => {
+  try { localStorage.setItem('gsa_hand', handSelect.value); } catch (e) { /* storage blocked */ }
+  if (analysis && analysis.frames.length) $('#trackingSummary').textContent = 'Handedness changed. Re-run tracking to apply it.';
+};
 
 function show(name) {
   Object.values(screens).forEach(x => x.classList.remove('active'));
@@ -122,7 +130,7 @@ async function loadVideo(blob, opts = {}) {
   club = opts.club || {};
   clubStep = null;
   metrics = null;
-  selectedPhase = 'address';
+  selectedPhase = 'P1';
   if (Pose) Pose.clearPose(poseCanvas);
   resetTrackingUi();
   clearOverlay();
@@ -141,6 +149,8 @@ async function loadVideo(blob, opts = {}) {
       await ensurePose();
       if (videoUrl !== url) return; // another video was loaded meanwhile
       analysis = opts.analysis || null;
+      Pose.migrateLegacy(analysis, club); // older saves used address/top/impact/finish
+      updateClubUi();
       if (analysis) $('#autoTrackingBtn').textContent = 'Re-run Tracking';
       renderPhases();
       refreshMetrics();
@@ -283,9 +293,14 @@ function resetTrackingUi() {
   renderMetrics();
 }
 
-const PHASE_KEYS = [['address', 'Address'], ['top', 'Top'], ['impact', 'Impact'], ['finish', 'Finish']];
+const PHASE_KEYS = [
+  ['P1', 'Address'], ['P2', 'Shaft parallel (backswing)'], ['P3', 'Lead arm parallel (backswing)'],
+  ['P4', 'Top of backswing'], ['P5', 'Lead arm parallel (downswing)'], ['P6', 'Shaft parallel (downswing)'],
+  ['P7', 'Impact'], ['P8', 'Shaft parallel (follow-through)'], ['P9', 'Lead arm parallel (follow-through)'],
+  ['P10', 'Finish'],
+];
 
-async function ensurePose() { return Pose || (Pose = await import('./pose.js?v=11')); }
+async function ensurePose() { return Pose || (Pose = await import('./pose.js?v=12')); }
 
 // Phases can be set by hand before (or without) tracking, so keep a stub analysis around when needed.
 function ensureAnalysis() {
@@ -304,8 +319,8 @@ function renderPhases() {
   PHASE_KEYS.forEach(([key, label]) => {
     const p = analysis && analysis.phases.find(x => x.key === key);
     const b = document.createElement('button');
-    b.className = 'phaseButton' + (p ? '' : ' missing') + (selectedPhase === key ? ' selected' : '') + (p && p.manual ? ' manual' : '');
-    b.textContent = label;
+    b.className = 'phaseButton' + (p ? '' : ' missing') + (selectedPhase === key ? ' selected' : '') + (p && p.manual ? ' manual' : '') + (p && p.estimated ? ' estimated' : '');
+    b.textContent = key + (p && p.estimated ? '~' : '');
     b.onclick = () => {
       selectedPhase = key;
       swingVideo.pause();
@@ -315,14 +330,15 @@ function renderPhases() {
     };
     row.appendChild(b);
   });
-  const label = PHASE_KEYS.find(k => k[0] === selectedPhase)[1];
-  $('#setPhase').textContent = `Set ${label} to this frame`;
+  const sel = PHASE_KEYS.find(k => k[0] === selectedPhase);
+  $('#setPhase').textContent = `Set ${sel[0]} · ${sel[1]} to this frame`;
 
   const parts = [];
   if (analysis && analysis.tempo) {
     parts.push(`Tempo ${analysis.tempo.ratio.toFixed(1)}:1 (backswing ${analysis.tempo.backswing.toFixed(2)}s, downswing ${analysis.tempo.downswing.toFixed(2)}s)`);
   }
   if (analysis && analysis.note) parts.push(analysis.note);
+  if (analysis && analysis.phases.some(p => p.estimated)) parts.push('~ = estimated from hand height (the body model can’t see the club), so check these or mark the club.');
   $('#trackingSummary').textContent = parts.join(' • ');
 }
 
@@ -353,10 +369,10 @@ $('#setPhase').onclick = async () => {
 function updateClubUi() {
   const row = $('#clubRow');
   row.innerHTML = '';
-  PHASE_KEYS.slice(0, 3).forEach(([key, label]) => {
+  PHASE_KEYS.forEach(([key]) => {
     const b = document.createElement('button');
     b.className = 'phaseButton' + (clubStep && clubStep.key === key ? ' selected' : '');
-    b.textContent = (club[key] ? '✓ ' : '') + label;
+    b.textContent = (club[key] ? '✓ ' : '') + key;
     b.onclick = () => toggleClubStep(key);
     row.appendChild(b);
   });
@@ -369,8 +385,8 @@ function updateClubUi() {
   $('#clubHelp').textContent = !clubStep
     ? 'Pick a position, then tap the grip end and the club head on that frame.'
     : clubStep.part === 'grip'
-      ? 'Tap the grip end of the club (top of the handle).'
-      : 'Now tap the club head.';
+      ? `${clubStep.key}: tap the grip end of the club (top of the handle).`
+      : `${clubStep.key}: now tap the club head.`;
 }
 
 async function toggleClubStep(key) {
@@ -455,11 +471,12 @@ $('#autoTrackingBtn').onclick = async () => {
   Pose?.clearPose(poseCanvas);
 
   try {
-    Pose = Pose || await import('./pose.js?v=11');
+    Pose = Pose || await import('./pose.js?v=12');
     btn.textContent = 'Loading model… (tap to cancel)';
     const previous = analysis;
     analysis = await Pose.analyzeVideo(swingVideo, {
       view: currentView,
+      lefty: handSelect.value === 'left',
       signal: analysisAbort.signal,
       onProgress: (p, msg) => { btn.textContent = `${msg} ${Math.round(p * 100)}% (tap to cancel)`; },
     });
@@ -488,7 +505,7 @@ function renderMetrics() {
   const el = $('#metricsTable');
   const m = metrics;
   if (!m || !m.rows.length) { el.innerHTML = ''; return; }
-  const cols = [['address', 'Address'], ['top', 'Top'], ['impact', 'Impact']];
+  const cols = PHASE_KEYS.filter(([k]) => m.rows.some(r => r.values[k] != null)).map(([k]) => [k, k]);
   const cell = (row, k) => {
     const v = row.values[k];
     if (v == null) return '<td>–</td>';
@@ -497,9 +514,9 @@ function renderMetrics() {
   };
   el.innerHTML =
     `<h3>${escapeHtml(m.view || 'Swing')} measurements</h3>` +
-    `<table><thead><tr><th></th>${cols.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead><tbody>` +
+    `<div class="tableScroll"><table><thead><tr><th></th>${cols.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead><tbody>` +
     m.rows.map(r => `<tr><th>${escapeHtml(r.label)}<small>${escapeHtml(r.unit)}</small></th>${cols.map(c => cell(r, c[0])).join('')}</tr>`).join('') +
-    `</tbody></table>` +
+    `</tbody></table></div>` +
     (m.note ? `<p class="metricsNote">${escapeHtml(m.note)}</p>` : '');
 }
 
